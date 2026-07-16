@@ -18,10 +18,9 @@ import (
 )
 
 const (
-	// defaultReleaseRepo is the upstream project that publishes GitHub Releases.
-	// Forks rarely create their own releases; point checks at upstream by default.
+	// defaultReleaseRepo is this fork's GitHub Releases source.
 	// Override with GROK2API_RELEASE_REPO=owner/name when needed.
-	defaultReleaseRepo = "chenyme/grok2api"
+	defaultReleaseRepo = "karlorz/grok2api"
 	maxReleaseBytes    = 1 << 20
 	maxNotesRunes      = 4096
 )
