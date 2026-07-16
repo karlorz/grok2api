@@ -9,7 +9,7 @@ echo "==== Step 1: Building ARM64 release bundle locally ===="
 make build-arm64
 
 echo "==== Step 2: Preparing remote host target directory ===="
-ssh "$HOST" "mkdir -p $TARGET_DIR/data"
+ssh "$HOST" "mkdir -p $TARGET_DIR/data && systemctl stop grok2api || true"
 
 echo "==== Step 3: Uploading binary, config, and frontend files ===="
 scp ./dist/grok2api "$HOST:$TARGET_DIR/grok2api"
@@ -35,9 +35,10 @@ ssh "$HOST" "
     ENC_KEY=\$(openssl rand -base64 32)
     ADMIN_PASS=\$(openssl rand -base64 16)
     
-    sed -i \"s|jwtSecret: \\\".*\\\"|jwtSecret: \\\"\$JWT_SECRET\\\"|g\" $TARGET_DIR/config.yaml
-    sed -i \"s|credentialEncryptionKey: \\\".*\\\"|credentialEncryptionKey: \\\"\$ENC_KEY\\\"|g\" $TARGET_DIR/config.yaml
-    sed -i \"s|password: \\\".*\\\"|password: \\\"\$ADMIN_PASS\\\"|g\" $TARGET_DIR/config.yaml
+    sed -i \"s|jwtSecret: \\\"replace-with-at-least-32-characters\\\"|jwtSecret: \\\"\$JWT_SECRET\\\"|g\" $TARGET_DIR/config.yaml
+    sed -i \"s|credentialEncryptionKey: \\\"replace-with-base64-key\\\"|credentialEncryptionKey: \\\"\$ENC_KEY\\\"|g\" $TARGET_DIR/config.yaml
+    sed -i \"s|password: \\\"replace-with-a-strong-password\\\"|password: \\\"\$ADMIN_PASS\\\"|g\" $TARGET_DIR/config.yaml
+    chmod 600 \$TARGET_DIR/config.yaml
     
     echo 'Initialized config.yaml with random secrets:'
     echo \"- Admin Username: admin\"
