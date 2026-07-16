@@ -24,6 +24,11 @@ permissions:
   id-token: write
   attestations: write
 
+# Optional override when default ghcr.io/owner/repo package is ACL-tainted (403).
+# Set repo variable GHCR_IMAGE_NAME=ghcr.io/karlorz/grok2api-app if needed.
+env:
+  GHCR_IMAGE_NAME: ${{ vars.GHCR_IMAGE_NAME }}
+
 jobs:
   verify:
     name: Verify
@@ -141,8 +146,18 @@ jobs:
         id: image
         shell: bash
         run: |
-          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
+          # Prefer classic ghcr.io/owner/repo. If that package is ACL-tainted after a
+          # rename/re-fork (push 403), set repo variable GHCR_IMAGE_NAME to a clean name
+          # e.g. ghcr.io/karlorz/grok2api-app
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          repo="$(printf '%s' "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')"
+          if [[ -n "${GHCR_IMAGE_NAME:-}" ]]; then
+            image_name="$GHCR_IMAGE_NAME"
+          else
+            image_name="ghcr.io/${owner}/${repo}"
+          fi
+          echo "name=$image_name" >> "$GITHUB_OUTPUT"
+          echo "Using image: $image_name"
 
       - name: Docker metadata
         id: meta
@@ -195,8 +210,14 @@ jobs:
         id: image
         shell: bash
         run: |
-          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          repo="$(printf '%s' "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')"
+          if [[ -n "${GHCR_IMAGE_NAME:-}" ]]; then
+            image_name="$GHCR_IMAGE_NAME"
+          else
+            image_name="ghcr.io/${owner}/${repo}"
+          fi
+          echo "name=$image_name" >> "$GITHUB_OUTPUT"
 
       - name: Docker metadata
         id: meta
