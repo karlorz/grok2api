@@ -38,7 +38,7 @@ ssh "$HOST" "
     sed -i \"s|jwtSecret: \\\"replace-with-at-least-32-characters\\\"|jwtSecret: \\\"\$JWT_SECRET\\\"|g\" $TARGET_DIR/config.yaml
     sed -i \"s|credentialEncryptionKey: \\\"replace-with-base64-key\\\"|credentialEncryptionKey: \\\"\$ENC_KEY\\\"|g\" $TARGET_DIR/config.yaml
     sed -i \"s|password: \\\"replace-with-a-strong-password\\\"|password: \\\"\$ADMIN_PASS\\\"|g\" $TARGET_DIR/config.yaml
-    chmod 600 \$TARGET_DIR/config.yaml
+    chmod 600 $TARGET_DIR/config.yaml
     
     echo 'Initialized config.yaml with random secrets:'
     echo \"- Admin Username: admin\"
