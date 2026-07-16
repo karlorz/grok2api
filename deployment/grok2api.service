@@ -1,0 +1,21 @@
+[Unit]
+Description=Grok2API Gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/grok2api
+ExecStart=/opt/grok2api/grok2api --config /opt/grok2api/config.yaml --listen 127.0.0.1:8000
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/grok2api
+
+[Install]
+WantedBy=multi-user.target
