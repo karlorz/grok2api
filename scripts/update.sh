@@ -126,8 +126,9 @@ echo "==== Step 3: Uploading binary and frontend ===="
 upload_release_bundle
 write_deploy_meta "$LOCAL_SHA"
 
-echo "==== Step 4: Restarting ${SERVICE_NAME} ===="
-ssh "$HOST" "systemctl start '${SERVICE_NAME}' && systemctl is-active '${SERVICE_NAME}'"
+echo "==== Step 4: Refreshing systemd unit + restarting ${SERVICE_NAME} ===="
+install_systemd_unit
+ssh "$HOST" "systemctl restart '${SERVICE_NAME}' && systemctl is-active '${SERVICE_NAME}'"
 
 echo "==== Step 5: Health checks ===="
 verify_health warn

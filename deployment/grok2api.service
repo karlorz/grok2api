@@ -8,6 +8,8 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/grok2api
+# Upstream publishes GitHub Releases; forks usually do not (404). Override if you cut your own tags.
+Environment=GROK2API_RELEASE_REPO=chenyme/grok2api
 ExecStart=/opt/grok2api/grok2api --config /opt/grok2api/config.yaml --listen 127.0.0.1:8000
 Restart=on-failure
 RestartSec=5s

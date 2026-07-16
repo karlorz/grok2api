@@ -17,8 +17,9 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 }
 
 func TestCheckFindsLatestRelease(t *testing.T) {
+	wantAPI := "https://api.github.com/repos/chenyme/grok2api/releases/latest"
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.String() != latestReleaseAPI || request.Header.Get("User-Agent") != "grok2api/v3.0.0" {
+		if request.URL.String() != wantAPI || request.Header.Get("User-Agent") != "grok2api/v3.0.0" {
 			t.Fatalf("request = %#v", request)
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v3.0.1","body":"Release notes"}`)), Header: make(http.Header)}, nil
@@ -64,5 +65,37 @@ func TestSemanticVersionComparison(t *testing.T) {
 	}
 	if _, ok := parseSemanticVersion("dev"); ok {
 		t.Fatal("development version was accepted as semver")
+	}
+}
+
+func TestNormalizeReleaseRepo(t *testing.T) {
+	if got := normalizeReleaseRepo(""); got != defaultReleaseRepo {
+		t.Fatalf("empty = %q", got)
+	}
+	if got := normalizeReleaseRepo("https://github.com/chenyme/grok2api.git"); got != "chenyme/grok2api" {
+		t.Fatalf("url = %q", got)
+	}
+	if got := normalizeReleaseRepo("karlorz/grok2api"); got != "karlorz/grok2api" {
+		t.Fatalf("fork = %q", got)
+	}
+	if got := normalizeReleaseRepo("../evil"); got != defaultReleaseRepo {
+		t.Fatalf("invalid = %q", got)
+	}
+}
+
+func TestCheckUsesCustomReleaseRepo(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.String() != "https://api.github.com/repos/acme/grok2api/releases/latest" {
+			t.Fatalf("request = %#v", request)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v9.0.0","body":"fork"}`)), Header: make(http.Header)}, nil
+	})}
+	service := NewServiceWithRepo("v3.0.0", client, "acme/grok2api")
+	snapshot := service.Check(context.Background())
+	if snapshot.Status != StatusUpdateAvailable || snapshot.LatestVersion != "v9.0.0" {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	if snapshot.ReleaseURL != "https://github.com/acme/grok2api/releases/tag/v9.0.0" {
+		t.Fatalf("release url = %q", snapshot.ReleaseURL)
 	}
 }

@@ -71,10 +71,23 @@ write_deploy_meta() {
   deploy_meta_body "$sha" | ssh "$HOST" "cat > '${TARGET_DIR}/${DEPLOY_META_FILE}' && chmod 644 '${TARGET_DIR}/${DEPLOY_META_FILE}'"
 }
 
-# Upload binary + example config + frontend in one stream; optional meta stamp after.
+# Upload binary + VERSION + example config + frontend in one stream.
 upload_release_bundle() {
-  COPYFILE_DISABLE=1 tar -czf - -C ./dist grok2api config.example.yaml frontend \
+  local -a extras=()
+  [[ -f ./dist/VERSION ]] && extras+=(VERSION)
+  COPYFILE_DISABLE=1 tar -czf - -C ./dist grok2api config.example.yaml frontend "${extras[@]}" \
     | ssh "$HOST" "tar -xzf - -C '${TARGET_DIR}' && chmod 755 '${TARGET_DIR}/grok2api'"
+}
+
+# Install/refresh systemd unit (safe to re-run on every update).
+install_systemd_unit() {
+  scp ./deployment/grok2api.service "$HOST:/tmp/grok2api.service"
+  ssh "$HOST" "
+    mv /tmp/grok2api.service /etc/systemd/system/grok2api.service
+    chmod 644 /etc/systemd/system/grok2api.service
+    systemctl daemon-reload
+    systemctl enable '${SERVICE_NAME}'
+  "
 }
 
 verify_health() {

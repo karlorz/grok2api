@@ -50,14 +50,8 @@ ssh "$HOST" "
 "
 
 echo "==== Step 5: Installing Systemd Service ===="
-scp ./deployment/grok2api.service "$HOST:/tmp/grok2api.service"
-ssh "$HOST" "
-  mv /tmp/grok2api.service /etc/systemd/system/grok2api.service
-  chmod 644 /etc/systemd/system/grok2api.service
-  systemctl daemon-reload
-  systemctl enable '${SERVICE_NAME}'
-  systemctl restart '${SERVICE_NAME}'
-"
+install_systemd_unit
+ssh "$HOST" "systemctl restart '${SERVICE_NAME}'"
 
 echo "==== Step 6: Configuring Caddy on ${HOST} ===="
 ssh "$HOST" "

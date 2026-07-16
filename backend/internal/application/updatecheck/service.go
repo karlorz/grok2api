@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,9 +18,12 @@ import (
 )
 
 const (
-	latestReleaseAPI = "https://api.github.com/repos/chenyme/grok2api/releases/latest"
-	maxReleaseBytes  = 1 << 20
-	maxNotesRunes    = 4096
+	// defaultReleaseRepo is the upstream project that publishes GitHub Releases.
+	// Forks rarely create their own releases; point checks at upstream by default.
+	// Override with GROK2API_RELEASE_REPO=owner/name when needed.
+	defaultReleaseRepo = "chenyme/grok2api"
+	maxReleaseBytes    = 1 << 20
+	maxNotesRunes      = 4096
 )
 
 type Status string
@@ -43,9 +47,10 @@ type Snapshot struct {
 }
 
 type Service struct {
-	current string
-	client  *http.Client
-	now     func() time.Time
+	current     string
+	releaseRepo string
+	client      *http.Client
+	now         func() time.Time
 
 	mu       sync.RWMutex
 	snapshot Snapshot
@@ -53,6 +58,12 @@ type Service struct {
 }
 
 func NewService(currentVersion string, client *http.Client) *Service {
+	return NewServiceWithRepo(currentVersion, client, os.Getenv("GROK2API_RELEASE_REPO"))
+}
+
+// NewServiceWithRepo builds an update checker that fetches latest GitHub Release
+// from owner/name (for example chenyme/grok2api). Empty repo uses defaultReleaseRepo.
+func NewServiceWithRepo(currentVersion string, client *http.Client, releaseRepo string) *Service {
 	currentVersion = strings.TrimSpace(currentVersion)
 	if currentVersion == "" {
 		currentVersion = "dev"
@@ -61,14 +72,43 @@ func NewService(currentVersion string, client *http.Client) *Service {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	return &Service{
-		current: currentVersion,
-		client:  client,
-		now:     time.Now,
+		current:     currentVersion,
+		releaseRepo: normalizeReleaseRepo(releaseRepo),
+		client:      client,
+		now:         time.Now,
 		snapshot: Snapshot{
 			CurrentVersion: currentVersion,
 			Status:         StatusUnchecked,
 		},
 	}
+}
+
+func normalizeReleaseRepo(repo string) string {
+	repo = strings.TrimSpace(repo)
+	repo = strings.TrimPrefix(repo, "https://github.com/")
+	repo = strings.TrimPrefix(repo, "http://github.com/")
+	repo = strings.TrimSuffix(repo, ".git")
+	repo = strings.Trim(repo, "/")
+	if repo == "" {
+		return defaultReleaseRepo
+	}
+	// Expect owner/name only; reject path traversal / query junk.
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return defaultReleaseRepo
+	}
+	if strings.ContainsAny(repo, " ?#@\\") || strings.Contains(repo, "..") {
+		return defaultReleaseRepo
+	}
+	return owner + "/" + name
+}
+
+func (s *Service) latestReleaseAPI() string {
+	return "https://api.github.com/repos/" + s.releaseRepo + "/releases/latest"
+}
+
+func (s *Service) releaseTagURL(tag string) string {
+	return "https://github.com/" + s.releaseRepo + "/releases/tag/" + url.PathEscape(tag)
 }
 
 func (s *Service) Snapshot() Snapshot {
@@ -120,7 +160,7 @@ type latestRelease struct {
 }
 
 func (s *Service) fetchLatest(ctx context.Context) (latestRelease, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, latestReleaseAPI, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.latestReleaseAPI(), nil)
 	if err != nil {
 		return latestRelease{}, err
 	}
@@ -133,7 +173,7 @@ func (s *Service) fetchLatest(ctx context.Context) (latestRelease, error) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return latestRelease{}, fmt.Errorf("GitHub Release 检查失败（HTTP %d）", response.StatusCode)
+		return latestRelease{}, fmt.Errorf("GitHub Release 检查失败（HTTP %d，仓库 %s）", response.StatusCode, s.releaseRepo)
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxReleaseBytes+1))
 	if err != nil {
@@ -155,7 +195,7 @@ func (s *Service) fetchLatest(ctx context.Context) (latestRelease, error) {
 	}
 	return latestRelease{
 		Tag:   payload.Tag,
-		URL:   "https://github.com/chenyme/grok2api/releases/tag/" + url.PathEscape(payload.Tag),
+		URL:   s.releaseTagURL(payload.Tag),
 		Notes: truncateRunes(strings.TrimSpace(payload.Body), maxNotesRunes),
 	}, nil
 }

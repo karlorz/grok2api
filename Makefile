@@ -1,9 +1,15 @@
 .PHONY: run swagger build-frontend build-backend-arm64 build-arm64 clean deploy update status
 
 CONFIG ?= $(CURDIR)/config.yaml
+# App version for About UI / update checks (must be valid semver like v3.0.1).
+APP_VERSION := $(shell tr -d '[:space:]' < $(CURDIR)/VERSION 2>/dev/null)
+ifeq ($(strip $(APP_VERSION)),)
+APP_VERSION := dev
+endif
+LDFLAGS ?= -s -w -X github.com/chenyme/grok2api/backend/internal/buildinfo.Version=$(APP_VERSION)
 
 run:
-	cd backend && GOCACHE=$(CURDIR)/.gocache go run ./cmd/grok2api --config "$(abspath $(CONFIG))" $(RUN_ARGS)
+	cd backend && GOCACHE=$(CURDIR)/.gocache go run -ldflags="$(LDFLAGS)" ./cmd/grok2api --config "$(abspath $(CONFIG))" $(RUN_ARGS)
 
 swagger:
 	cd backend && GOCACHE=$(CURDIR)/.gocache go run github.com/swaggo/swag/cmd/swag@v1.16.6 init \
@@ -18,7 +24,8 @@ build-frontend:
 
 build-backend-arm64:
 	mkdir -p dist
-	cd backend && GOCACHE=$(CURDIR)/.gocache CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o ../dist/grok2api ./cmd/grok2api
+	@echo "Building backend with APP_VERSION=$(APP_VERSION)"
+	cd backend && GOCACHE=$(CURDIR)/.gocache CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="$(LDFLAGS)" -o ../dist/grok2api ./cmd/grok2api
 
 # Sequential targets avoid parallel race between clean and compile.
 build-arm64:
@@ -28,6 +35,7 @@ build-arm64:
 	mkdir -p dist/frontend
 	cp -r frontend/dist dist/frontend/dist
 	cp config.example.yaml dist/config.example.yaml
+	cp VERSION dist/VERSION
 
 # First install / full setup on kr01 (config, systemd, Caddy). Stamps .deploy-meta.
 deploy:
