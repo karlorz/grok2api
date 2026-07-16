@@ -15,8 +15,12 @@ concurrency:
   group: ghcr-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Workflow-level defaults; publish jobs restate packages write for clarity.
 permissions:
   contents: read
+  packages: write
+  id-token: write
+  attestations: write
 
 jobs:
   verify:
@@ -110,6 +114,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -146,12 +152,13 @@ jobs:
             type=ref,event=tag,suffix=-${{ matrix.arch }}
             type=raw,value=latest-${{ matrix.arch }},enable=${{ github.ref == 'refs/heads/main' }}
 
+      # Prefer optional GHCR_TOKEN (write:packages) when present; else GITHUB_TOKEN.
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Build and publish
         uses: docker/build-push-action@v6
@@ -164,8 +171,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
-          provenance: mode=max
-          sbom: true
+          # provenance/sbom attestations often 403 on first package create / renamed repos
+          provenance: false
+          sbom: false
 
   merge:
     name: Merge image
@@ -202,8 +210,8 @@ jobs:
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Create manifest list
         shell: bash
@@ -217,3 +225,22 @@ jobs:
 
       - name: Inspect image
         run: docker buildx imagetools inspect "${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}"
+
+      - name: Make package public (best effort)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Links package to this repo and sets public visibility when possible.
+          package="${GITHUB_REPOSITORY##*/}"
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          gh api \
+            --method PUT \
+            -H "Accept: application/vnd.github+json" \
+            "/user/packages/container/${package}/visibility" \
+            -f visibility=public || true
+          gh api \
+            --method PUT \
+            -H "Accept: application/vnd.github+json" \
+            "/user/packages/container/${package}/versions" >/dev/null 2>&1 || true
+          echo "package=${owner}/${package} image=${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}"

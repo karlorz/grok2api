@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish as a GitHub Release (e.g. v3.0.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  github_release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "Invalid semver tag: $tag" >&2
+            exit 1
+          fi
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure tag exists
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch --tags --force
+          git rev-parse "refs/tags/${{ steps.tag.outputs.name }}" >/dev/null
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.name }}"
+          notes_file="$(mktemp)"
+          {
+            echo "## ${tag}"
+            echo
+            if [[ -f VERSION ]]; then
+              echo "VERSION file: \`$(tr -d '[:space:]' < VERSION)\`"
+              echo
+            fi
+            echo "### Images"
+            echo
+            repo_lc="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+            echo "- \`ghcr.io/${repo_lc}:${tag}\`"
+            echo "- \`ghcr.io/${repo_lc}:latest\` (when built from main)"
+            echo
+            echo "### Install / update (binary on kr01)"
+            echo
+            echo '```bash'
+            echo 'git fetch origin && git checkout main && git pull --ff-only'
+            echo 'make update'
+            echo '```'
+            echo
+            echo "### Commits"
+            echo
+            # Prefer notes since previous tag when available
+            prev="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
+            if [[ -n "$prev" ]]; then
+              git log --pretty=format:'- %s (%h)' "${prev}..${tag}"
+            else
+              git log --pretty=format:'- %s (%h)' -20 "${tag}"
+            fi
+            echo
+          } > "$notes_file"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; updating notes"
+            gh release edit "$tag" --notes-file "$notes_file" --title "$tag"
+          else
+            gh release create "$tag" \
+              --title "$tag" \
+              --notes-file "$notes_file" \
+              --verify-tag
+          fi
+          gh release view "$tag" --json url,tagName,isDraft,isPrerelease

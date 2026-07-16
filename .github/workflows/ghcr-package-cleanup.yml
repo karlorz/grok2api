@@ -1,0 +1,45 @@
+name: GHCR package cleanup
+
+# One-shot helper when GHCR push returns 403 after repo rename/re-fork.
+# Deletes user package container "grok2api" so the next GHCR Image run can recreate it linked to this repo.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type delete-grok2api to confirm'
+        required: true
+        type: string
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  delete_package:
+    name: Delete container package
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'delete-grok2api'
+    steps:
+      - name: Delete package via API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="${GITHUB_REPOSITORY##*/}"
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          echo "Attempting delete of container package: ${owner}/${package}"
+          # User-owned package delete (works when package is under the user namespace)
+          if gh api --method DELETE "/user/packages/container/${package}"; then
+            echo "Deleted /user/packages/container/${package}"
+            exit 0
+          fi
+          # Fallback: users/{owner} path
+          if gh api --method DELETE "/users/${owner}/packages/container/${package}"; then
+            echo "Deleted /users/${owner}/packages/container/${package}"
+            exit 0
+          fi
+          echo "Could not delete package with GITHUB_TOKEN."
+          echo "Open https://github.com/users/${owner}/packages/container/package/${package}"
+          echo "→ Package settings → Delete this package, then re-run GHCR Image."
+          exit 1
