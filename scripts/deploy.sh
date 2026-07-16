@@ -12,9 +12,10 @@ echo "==== Step 2: Preparing remote host target directory ===="
 ssh "$HOST" "mkdir -p $TARGET_DIR/data"
 
 echo "==== Step 3: Uploading binary, config, and frontend files ===="
-rsync -avz --progress ./dist/grok2api "$HOST:$TARGET_DIR/grok2api"
-rsync -avz --progress ./dist/config.example.yaml "$HOST:$TARGET_DIR/config.example.yaml"
-rsync -avz --progress --delete ./dist/frontend/ "$HOST:$TARGET_DIR/frontend/"
+scp ./dist/grok2api "$HOST:$TARGET_DIR/grok2api"
+scp ./dist/config.example.yaml "$HOST:$TARGET_DIR/config.example.yaml"
+# Stream frontend/ directory via tar over SSH
+tar -czf - -C ./dist frontend | ssh "$HOST" "tar -xzf - -C $TARGET_DIR"
 
 echo "==== Step 4: Setting up remote config.yaml ===="
 ssh "$HOST" "
