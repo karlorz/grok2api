@@ -22,11 +22,27 @@ ssh "$HOST" "
   if [ ! -f $TARGET_DIR/config.yaml ]; then
     echo 'No config.yaml found on host. Initializing with default example...'
     cp $TARGET_DIR/config.example.yaml $TARGET_DIR/config.yaml
+  fi
+
+  if grep -q 'replace-with' $TARGET_DIR/config.yaml; then
+    echo 'Placeholders detected in config.yaml. Generating random secrets...'
     # Update paths in config.yaml
     sed -i 's|staticPath: \".*\"|staticPath: \"$TARGET_DIR/frontend/dist\"|g' $TARGET_DIR/config.yaml
     sed -i 's|path: \"\./data/backend\.db\"|path: \"$TARGET_DIR/data/backend.db\"|g' $TARGET_DIR/config.yaml
     sed -i 's|path: \"\./data/media\"|path: \"$TARGET_DIR/data/media\"|g' $TARGET_DIR/config.yaml
-    echo 'Initialized config.yaml. Please edit secrets on the server manually if needed!'
+    
+    JWT_SECRET=\$(openssl rand -hex 32)
+    ENC_KEY=\$(openssl rand -base64 32)
+    ADMIN_PASS=\$(openssl rand -base64 16)
+    
+    sed -i \"s|jwtSecret: \\\".*\\\"|jwtSecret: \\\"\$JWT_SECRET\\\"|g\" $TARGET_DIR/config.yaml
+    sed -i \"s|credentialEncryptionKey: \\\".*\\\"|credentialEncryptionKey: \\\"\$ENC_KEY\\\"|g\" $TARGET_DIR/config.yaml
+    sed -i \"s|password: \\\".*\\\"|password: \\\"\$ADMIN_PASS\\\"|g\" $TARGET_DIR/config.yaml
+    
+    echo 'Initialized config.yaml with random secrets:'
+    echo \"- Admin Username: admin\"
+    echo \"- Admin Password: \$ADMIN_PASS\"
+    echo 'Please save these credentials!'
   fi
 "
 
