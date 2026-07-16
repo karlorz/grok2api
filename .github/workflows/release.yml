@@ -1,13 +1,18 @@
 name: Release
 
+# Fork tags are distinct from upstream official tags:
+#   upstream: v3.0.2
+#   fork:     v3.0.2-0, v3.0.2-1, ...
+# Prefer cutting tags with: ./scripts/fork-tag.sh --write && git commit && ./scripts/fork-tag.sh --release
 on:
   push:
     tags:
       - "v*.*.*"
+      - "v*.*.*-*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to publish as a GitHub Release (e.g. v3.0.1)"
+        description: "Existing fork tag (e.g. v3.0.2-0)"
         required: true
         type: string
 
@@ -37,11 +42,21 @@ jobs:
           else
             tag="${GITHUB_REF_NAME}"
           fi
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
-            echo "Invalid semver tag: $tag" >&2
+          # Prefer fork scheme vX.Y.Z-N; still accept plain vX.Y.Z for compatibility.
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "Invalid tag (want vX.Y.Z or fork vX.Y.Z-N): $tag" >&2
             exit 1
           fi
           echo "name=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$tag" =~ -[0-9]+$ ]]; then
+            echo "scheme=fork" >> "$GITHUB_OUTPUT"
+            echo "upstream_base=${tag%-*}" >> "$GITHUB_OUTPUT"
+            echo "fork_rev=${tag##*-}" >> "$GITHUB_OUTPUT"
+          else
+            echo "scheme=official-style" >> "$GITHUB_OUTPUT"
+            echo "upstream_base=$tag" >> "$GITHUB_OUTPUT"
+            echo "fork_rev=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Ensure tag exists
         if: github.event_name == 'workflow_dispatch'
@@ -62,6 +77,13 @@ jobs:
           {
             echo "## ${tag}"
             echo
+            echo "Fork version scheme: \`upstream vX.Y.Z\` → fork \`vX.Y.Z-0\`, \`vX.Y.Z-1\`, …"
+            echo
+            if [[ "${{ steps.tag.outputs.scheme }}" == "fork" ]]; then
+              echo "- Upstream base: \`${{ steps.tag.outputs.upstream_base }}\`"
+              echo "- Fork revision: \`${{ steps.tag.outputs.fork_rev }}\`"
+              echo
+            fi
             if [[ -f VERSION ]]; then
               echo "VERSION file: \`$(tr -d '[:space:]' < VERSION)\`"
               echo

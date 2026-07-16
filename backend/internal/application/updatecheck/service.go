@@ -243,11 +243,26 @@ func compareSemanticVersion(left, right semanticVersion) int {
 	if left.prerelease == right.prerelease {
 		return 0
 	}
+	// Official upstream tags (no suffix) rank above fork builds of the same X.Y.Z
+	// (v3.0.2 > v3.0.2-0). Among fork revs, compare numerically when possible
+	// (v3.0.2-2 > v3.0.2-10 is wrong with string compare — use ints for pure digits).
 	if left.prerelease == "" {
 		return 1
 	}
 	if right.prerelease == "" {
 		return -1
+	}
+	if ln, lerr := strconv.ParseUint(left.prerelease, 10, 64); lerr == nil {
+		if rn, rerr := strconv.ParseUint(right.prerelease, 10, 64); rerr == nil {
+			switch {
+			case ln < rn:
+				return -1
+			case ln > rn:
+				return 1
+			default:
+				return 0
+			}
+		}
 	}
 	return strings.Compare(left.prerelease, right.prerelease)
 }

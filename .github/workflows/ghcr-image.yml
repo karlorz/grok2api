@@ -5,7 +5,9 @@ on:
     branches:
       - main
     tags:
+      # upstream-style v3.0.2 and fork-style v3.0.2-0 / v3.0.2-1
       - "v*.*.*"
+      - "v*.*.*-*"
   pull_request:
     branches:
       - main

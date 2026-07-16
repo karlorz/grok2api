@@ -1,7 +1,7 @@
-.PHONY: run swagger build-frontend build-backend-arm64 build-arm64 clean deploy update status
+.PHONY: run swagger build-frontend build-backend-arm64 build-arm64 clean deploy update status version-next version-bump version-release
 
 CONFIG ?= $(CURDIR)/config.yaml
-# App version for About UI / update checks (must be valid semver like v3.0.1).
+# App version for About UI / update checks. Fork scheme: v3.0.2-0 (upstream v3.0.2 + rev).
 APP_VERSION := $(shell tr -d '[:space:]' < $(CURDIR)/VERSION 2>/dev/null)
 ifeq ($(strip $(APP_VERSION)),)
 APP_VERSION := dev
@@ -49,6 +49,20 @@ update:
 # Read-only probe: local/remote/deployed SHA + health. VERBOSE=1 for full systemctl status.
 status:
 	./scripts/status.sh
+
+# Fork tags: upstream v3.0.2 → fork v3.0.2-0, v3.0.2-1, ...
+#   make version-next              # print next tag
+#   make version-bump              # write next into VERSION
+#   make version-bump BASE=v3.1.0  # start new series at v3.1.0-0
+#   make version-release           # push tag + GitHub Release from VERSION
+version-next:
+	./scripts/fork-tag.sh --next
+
+version-bump:
+	./scripts/fork-tag.sh $(if $(BASE),--base $(BASE)) --write
+
+version-release:
+	./scripts/fork-tag.sh --release
 
 clean:
 	rm -rf dist/

@@ -66,6 +66,23 @@ func TestSemanticVersionComparison(t *testing.T) {
 	if _, ok := parseSemanticVersion("dev"); ok {
 		t.Fatal("development version was accepted as semver")
 	}
+	// Fork scheme: v3.0.2-0 < v3.0.2-1 < v3.0.2 (upstream official ranks higher)
+	fork0, ok := parseSemanticVersion("v3.0.2-0")
+	if !ok {
+		t.Fatal("fork tag v3.0.2-0 rejected")
+	}
+	fork1, _ := parseSemanticVersion("v3.0.2-1")
+	fork10, _ := parseSemanticVersion("v3.0.2-10")
+	upstream, _ := parseSemanticVersion("v3.0.2")
+	if compareSemanticVersion(fork1, fork0) <= 0 {
+		t.Fatal("expected v3.0.2-1 > v3.0.2-0")
+	}
+	if compareSemanticVersion(fork10, fork1) <= 0 {
+		t.Fatal("expected v3.0.2-10 > v3.0.2-1 (numeric fork rev)")
+	}
+	if compareSemanticVersion(upstream, fork10) <= 0 {
+		t.Fatal("expected upstream v3.0.2 > fork v3.0.2-10")
+	}
 }
 
 func TestNormalizeReleaseRepo(t *testing.T) {
