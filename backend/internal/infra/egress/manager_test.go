@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -19,6 +21,38 @@ func TestDirectFallbackRebuildsClientAfterAntiBotRejection(t *testing.T) {
 	manager.Feedback(context.Background(), 0, http.StatusForbidden, nil)
 	if len(manager.clients) != 0 {
 		t.Fatal("direct fallback client was not invalidated after anti-bot rejection")
+	}
+}
+
+func TestClientCacheEvictsIdleEntriesAndEnforcesCapacity(t *testing.T) {
+	now := time.Now()
+	idleClient := &scriptedRequestClient{}
+	freshClient := &scriptedRequestClient{}
+	idleKey := clientCacheKey{nodeID: 1, scope: domain.ScopeWeb, fingerprint: "idle"}
+	freshKey := clientCacheKey{nodeID: 1, scope: domain.ScopeWeb, fingerprint: "fresh"}
+	manager := &Manager{clients: map[clientCacheKey]cachedClient{
+		idleKey:  {client: idleClient, lastUsed: now.Add(-clientCacheIdleTTL)},
+		freshKey: {client: freshClient, lastUsed: now},
+	}}
+	manager.cleanupClientCacheLocked(now)
+	if _, exists := manager.clients[idleKey]; exists || idleClient.closedIdle != 1 {
+		t.Fatalf("idle client exists=%v closed=%d", exists, idleClient.closedIdle)
+	}
+	if _, exists := manager.clients[freshKey]; !exists || freshClient.closedIdle != 0 {
+		t.Fatalf("fresh client exists=%v closed=%d", exists, freshClient.closedIdle)
+	}
+
+	oldestClient := &scriptedRequestClient{}
+	oldestKey := clientCacheKey{nodeID: 2, scope: domain.ScopeBuild, fingerprint: "oldest"}
+	manager.clients = make(map[clientCacheKey]cachedClient, maxCachedClients)
+	manager.clients[oldestKey] = cachedClient{client: oldestClient, lastUsed: now.Add(-time.Hour)}
+	for index := 1; index < maxCachedClients; index++ {
+		key := clientCacheKey{nodeID: uint64(index + 2), scope: domain.ScopeBuild, fingerprint: "cached"}
+		manager.clients[key] = cachedClient{lastUsed: now}
+	}
+	manager.ensureClientCacheCapacityLocked()
+	if len(manager.clients) != maxCachedClients-1 || oldestClient.closedIdle != 1 {
+		t.Fatalf("cache size=%d oldest closed=%d", len(manager.clients), oldestClient.closedIdle)
 	}
 }
 
@@ -88,6 +122,16 @@ func TestConfiguredCoolingAppNodesNeverFallBackToDirect(t *testing.T) {
 	}}}, cipher)
 	if _, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account"); err == nil {
 		t.Fatal("cooling configured node unexpectedly fell back to direct")
+	}
+}
+
+func TestDisabledConfiguredNodesAllowDirectFallback(t *testing.T) {
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{{
+		ID: 1, Name: "disabled-proxy", Scope: domain.ScopeBuild, Enabled: false, Health: 1,
+	}}}, nil)
+	lease, configured, err := manager.AcquireIfConfigured(context.Background(), domain.ScopeBuild, "")
+	if err != nil || configured || lease != nil {
+		t.Fatalf("disabled proxy fallback: lease=%#v configured=%v err=%v", lease, configured, err)
 	}
 }
 
@@ -181,6 +225,149 @@ func TestConfiguredWebNodeKeepsChromeBrowserTransport(t *testing.T) {
 	}
 }
 
+func TestAcquireCredentialRendersResinAccountAndOverridesNodeCookie(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("socks5h://Default.{account}:token@resin:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeCookie, err := cipher.Encrypt("cf_clearance=node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountCookie, err := cipher.Encrypt("cf_clearance=account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{{
+		ID: 1, Name: "resin", Scope: domain.ScopeWeb, Enabled: true, Health: 1,
+		EncryptedProxyURL: proxyURL, EncryptedCloudflareCookie: nodeCookie,
+	}}}, cipher)
+	first, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderWeb, EncryptedCloudflareCookie: accountCookie,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	if first.ProxyURL != "socks5h://Default.grok_web_42:token@resin:2260" {
+		t.Fatalf("first proxy URL = %q", first.ProxyURL)
+	}
+	if first.CFCookies != "cf_clearance=account" || !first.sticky {
+		t.Fatalf("first lease cookie=%q sticky=%v", first.CFCookies, first.sticky)
+	}
+	second, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{
+		ID: 43, Provider: accountdomain.ProviderWeb,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.ProxyURL != "socks5h://Default.grok_web_43:token@resin:2260" {
+		t.Fatalf("second proxy URL = %q", second.ProxyURL)
+	}
+	if second.CFCookies != "cf_clearance=node" {
+		t.Fatalf("second lease cookie = %q", second.CFCookies)
+	}
+	if first.client == second.client {
+		t.Fatal("different Resin accounts unexpectedly shared one connection pool")
+	}
+	if len(manager.clients) != 2 {
+		t.Fatalf("cached Resin account pools = %d, want 2", len(manager.clients))
+	}
+}
+
+func TestLinkedProvidersSharePersistedResinIdentity(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("socks5h://Default.{account}:token@resin:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstToken, _ := cipher.Encrypt("first-sso")
+	rotatedToken, _ := cipher.Encrypt("rotated-sso")
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{
+		{ID: 1, Name: "web", Scope: domain.ScopeWeb, Enabled: true, Health: 1, EncryptedProxyURL: proxyURL},
+		{ID: 2, Name: "build", Scope: domain.ScopeBuild, Enabled: true, Health: 1, EncryptedProxyURL: proxyURL},
+	}}, cipher)
+	const identity = "sso_persisted_identity"
+	web, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{
+		ID: 11, Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		EncryptedAccessToken: firstToken, EgressIdentity: identity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer web.Release()
+	console, err := manager.AcquireCredential(context.Background(), domain.ScopeConsole, accountdomain.Credential{
+		ID: 22, Provider: accountdomain.ProviderConsole, AuthType: accountdomain.AuthTypeSSO,
+		EncryptedAccessToken: rotatedToken, EgressIdentity: identity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer console.Release()
+	buildCtx := WithCredential(context.Background(), accountdomain.Credential{ID: 33, Provider: accountdomain.ProviderBuild, EgressIdentity: identity})
+	build, configured, err := manager.AcquireIfConfigured(buildCtx, domain.ScopeBuild, AccountFromContext(buildCtx))
+	if err != nil || !configured {
+		t.Fatalf("build configured=%v err=%v", configured, err)
+	}
+	defer build.Release()
+	for name, proxy := range map[string]string{"web": web.ProxyURL, "console": console.ProxyURL, "build": build.ProxyURL} {
+		if !strings.Contains(proxy, "Default."+identity+":") {
+			t.Fatalf("%s proxy = %q", name, proxy)
+		}
+	}
+}
+
+func TestConsoleFallsBackToWebAndSharesSSOResinIdentity(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("socks5h://Default.{account}:token@resin:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "shared-web-console-sso"
+	encryptedToken, err := cipher.Encrypt(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{{
+		ID: 7, Name: "shared-web", Scope: domain.ScopeWeb, Enabled: true, Health: 1,
+		EncryptedProxyURL: proxyURL,
+	}}}, cipher)
+	web, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{
+		ID: 11, Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		EncryptedAccessToken: encryptedToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer web.Release()
+	console, err := manager.AcquireCredential(context.Background(), domain.ScopeConsole, accountdomain.Credential{
+		ID: 22, Provider: accountdomain.ProviderConsole, AuthType: accountdomain.AuthTypeSSO,
+		EncryptedAccessToken: encryptedToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer console.Release()
+	wantAccount := "sso_" + security.HashToken(token)[:32]
+	if web.NodeID != 7 || console.NodeID != 7 {
+		t.Fatalf("nodes web=%d console=%d, want shared Web node", web.NodeID, console.NodeID)
+	}
+	if !strings.Contains(web.ProxyURL, "Default."+wantAccount+":") || web.ProxyURL != console.ProxyURL {
+		t.Fatalf("proxy identities web=%q console=%q", web.ProxyURL, console.ProxyURL)
+	}
+}
+
 func TestBuildForbiddenDoesNotPoisonEgressNode(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
@@ -223,20 +410,59 @@ func TestWebForbiddenStillRebuildsBrowserSession(t *testing.T) {
 	}
 }
 
-func TestWebAssetFallsBackToWeb(t *testing.T) {
+func TestStickyProxyForbiddenDoesNotCooldownSharedNode(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
 		t.Fatal(err)
 	}
+	proxy, err := cipher.Encrypt("socks5h://Default.{account}:token@resin:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "resin", Scope: domain.ScopeWeb, Enabled: true, Health: 1, EncryptedProxyURL: proxy}}
+	manager := NewManager(repository, cipher)
+	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{ID: 42, Provider: accountdomain.ProviderWeb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+	manager.Feedback(context.Background(), 1, http.StatusForbidden, nil)
+	if repository.updates != 0 || repository.node.Health != 1 || repository.node.LastError != "" {
+		t.Fatalf("sticky proxy 403 changed shared node: updates=%d node=%#v", repository.updates, repository.node)
+	}
+}
+
+func TestWebAssetCredentialFallsBackToWebWithSameResinIdentity(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("socks5h://Default.{account}:token@resin:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountCookie, err := cipher.Encrypt("cf_clearance=account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "shared-web-asset-sso"
+	encryptedToken, err := cipher.Encrypt(token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{
-		{ID: 2, Name: "web", Scope: domain.ScopeWeb, Enabled: true, Health: 1},
+		{ID: 2, Name: "web", Scope: domain.ScopeWeb, Enabled: true, Health: 1, EncryptedProxyURL: proxyURL},
 	}}, cipher)
-	webLease, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+	credential := accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		EncryptedAccessToken: encryptedToken, EncryptedCloudflareCookie: accountCookie,
+	}
+	webLease, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, credential)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer webLease.Release()
-	lease, err := manager.Acquire(context.Background(), domain.ScopeWebAsset, "account")
+	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeWebAsset, credential)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,8 +470,15 @@ func TestWebAssetFallsBackToWeb(t *testing.T) {
 	if lease.NodeID != 2 {
 		t.Fatalf("node = %d, want web fallback node 2", lease.NodeID)
 	}
+	wantAccount := "sso_" + security.HashToken(token)[:32]
+	if lease.ProxyURL != webLease.ProxyURL || !strings.Contains(lease.ProxyURL, "Default."+wantAccount+":") {
+		t.Fatalf("proxy identities web=%q asset=%q", webLease.ProxyURL, lease.ProxyURL)
+	}
+	if lease.CFCookies != "cf_clearance=account" {
+		t.Fatalf("asset lease cookie = %q", lease.CFCookies)
+	}
 	if lease.client != webLease.client {
-		t.Fatal("Web Asset fallback did not reuse the matching Web browser session")
+		t.Fatal("Web Asset credential fallback did not reuse the matching Web browser session")
 	}
 }
 

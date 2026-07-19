@@ -21,9 +21,12 @@ type importDocument struct {
 }
 
 type importEntry struct {
-	Name     string `json:"name"`
-	SSOToken string `json:"sso_token"`
-	Token    string `json:"token"`
+	Name              string `json:"name"`
+	Email             string `json:"email,omitempty"`
+	UserID            string `json:"user_id,omitempty"`
+	SSOToken          string `json:"sso_token"`
+	Token             string `json:"token"`
+	CloudflareCookies string `json:"cloudflare_cookies"`
 }
 
 func parseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
@@ -65,7 +68,11 @@ func parseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
 		if name == "" {
 			name = "Grok Console " + security.HashToken(token)[:8]
 		}
-		result = append(result, credentialSeed(name, token))
+		seed := credentialSeed(name, token)
+		seed.Email = strings.TrimSpace(entry.Email)
+		seed.UserID = strings.TrimSpace(entry.UserID)
+		seed.CloudflareCookies = entry.CloudflareCookies
+		result = append(result, seed)
 	}
 	return result, nil
 }
@@ -107,7 +114,7 @@ func credentialSeed(name, token string) provider.CredentialSeed {
 func marshalCredentials(values []provider.CredentialSeed) ([]byte, error) {
 	document := importDocument{Provider: string(account.ProviderConsole), Accounts: make([]importEntry, 0, len(values))}
 	for _, value := range values {
-		document.Accounts = append(document.Accounts, importEntry{Name: value.Name, SSOToken: value.AccessToken})
+		document.Accounts = append(document.Accounts, importEntry{Name: value.Name, Email: value.Email, UserID: value.UserID, SSOToken: value.AccessToken, CloudflareCookies: value.CloudflareCookies})
 	}
 	data, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {

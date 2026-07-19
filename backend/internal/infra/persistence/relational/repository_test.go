@@ -32,7 +32,7 @@ func TestSchemaAndRepositoryConstraints(t *testing.T) {
 	}
 
 	accountRepo := NewAccountRepository(database)
-	value := account.Credential{Provider: account.ProviderBuild, Name: "first", UserID: "user-1", SourceKey: "source", EncryptedAccessToken: "encrypted-a", EncryptedRefreshToken: "encrypted-r", ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 4}
+	value := account.Credential{Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "first", UserID: "user-1", SourceKey: "source", EncryptedAccessToken: "encrypted-a", EncryptedCloudflareCookie: "encrypted-cf", ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 4}
 	created, wasCreated, err := accountRepo.UpsertByIdentity(context.Background(), value)
 	if err != nil || !wasCreated {
 		t.Fatalf("首次 upsert = %#v, %v, %v", created, wasCreated, err)
@@ -46,8 +46,9 @@ func TestSchemaAndRepositoryConstraints(t *testing.T) {
 	}
 	value.Name = "updated"
 	value.EncryptedAccessToken = "encrypted-new"
+	value.EncryptedCloudflareCookie = ""
 	updated, wasCreated, err := accountRepo.UpsertByIdentity(context.Background(), value)
-	if err != nil || wasCreated || updated.ID != created.ID || updated.Name != "updated" || updated.LastUsedAt == nil || updated.ObservedModel != "grok-observed" || updated.ObservedModelAt == nil {
+	if err != nil || wasCreated || updated.ID != created.ID || updated.Name != "updated" || updated.LastUsedAt == nil || updated.ObservedModel != "grok-observed" || updated.ObservedModelAt == nil || updated.EncryptedCloudflareCookie != "encrypted-cf" {
 		t.Fatalf("幂等 upsert = %#v, %v, %v", updated, wasCreated, err)
 	}
 }
@@ -428,8 +429,9 @@ func TestFreshSchemaContract(t *testing.T) {
 			t.Fatalf("missing table for %T", model)
 		}
 	}
-	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
+	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status", "build_api_fallback", "build_route_mode", "build_super_entitled"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
 	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error", "refresh_permanent"}, nil)
+	assertTableColumns(t, database, "web_account_profiles", []string{"account_id", "tier", "synced_at", "nsfw_enabled_at"}, nil)
 	assertTableColumns(t, database, "admin_sessions", nil, []string{"revoked_at"})
 	assertTableColumns(t, database, "account_model_capabilities", []string{"account_id", "upstream_model"}, []string{"provider", "synced_at"})
 	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds"}, nil)

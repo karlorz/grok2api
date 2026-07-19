@@ -27,6 +27,7 @@ type ImageGenerationInput struct {
 	Resolution     string
 	ResponseFormat string
 	Streaming      bool
+	PartialImages  int
 }
 
 // ImageEditInput 表示图片编辑用例已经完成协议校验后的输入。
@@ -37,8 +38,12 @@ type ImageEditInput struct {
 	Prompt         string
 	ImageURLs      []string
 	Count          int
+	Size           string
+	AspectRatio    string
 	Resolution     string
 	ResponseFormat string
+	Streaming      bool
+	PartialImages  int
 }
 
 type imageProviderSupport func(accountdomain.Provider) bool
@@ -58,7 +63,7 @@ func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput)
 		return adapter.GenerateImage(executionCtx, provider.ImageGenerationRequest{
 			Credential: credential, Model: upstream, Prompt: input.Prompt, Count: input.Count,
 			Size: input.Size, AspectRatio: input.AspectRatio, Resolution: input.Resolution,
-			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming,
+			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming, PartialImages: input.PartialImages,
 		})
 	}, input.Streaming, input.Resolution, input.Count, 0)
 }
@@ -75,9 +80,11 @@ func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result,
 		}
 		return adapter.EditImage(executionCtx, provider.ImageEditRequest{
 			Credential: credential, Model: upstream, Prompt: input.Prompt,
-			ImageURLs: input.ImageURLs, Count: input.Count, Resolution: input.Resolution, ResponseFormat: input.ResponseFormat,
+			ImageURLs: input.ImageURLs, Count: input.Count, Size: input.Size, AspectRatio: input.AspectRatio,
+			Resolution: input.Resolution, ResponseFormat: input.ResponseFormat,
+			Streaming: input.Streaming, PartialImages: input.PartialImages,
 		})
-	}, false, input.Resolution, input.Count, len(input.ImageURLs))
+	}, input.Streaming, input.Resolution, input.Count, len(input.ImageURLs))
 }
 
 func (s *Service) executeImage(
@@ -184,6 +191,14 @@ func (s *Service) executeImage(
 		response, err = execute(ctx, route.Provider, credential, route.UpstreamModel)
 		if err != nil {
 			s.logger.Error("image_upstream_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", credential.ID, "error", err)
+			if isSSOCredentialRejected(err, credential) {
+				s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+				failedCredential := credential
+				lastCredentialFailure = &failedCredential
+				lastCredentialError = provider.ErrUnauthorized
+				lease.Release()
+				continue
+			}
 			if !provider.IsMediaPostProcessingError(err) {
 				s.selector.MarkFailure(ctx, credential, 0, 0)
 			}
@@ -194,6 +209,16 @@ func (s *Service) executeImage(
 			}
 			writeFailureAudit(http.StatusBadGateway, errorCode, &credential)
 			return nil, err
+		}
+		if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
+			_, _ = readRetryableBody(response.Body)
+			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+			failedCredential := credential
+			lastCredentialFailure = &failedCredential
+			lastCredentialError = provider.ErrUnauthorized
+			response = nil
+			lease.Release()
+			continue
 		}
 		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attempt+1 < attempts {
 			_, _ = readRetryableBody(response.Body)
@@ -222,10 +247,6 @@ func (s *Service) executeImage(
 			lastCredentialError = ErrNoAvailableAccount
 		}
 		return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastCredentialError)
-	}
-	if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
-		_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-		s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
 	}
 	effectiveQuotaMode := lease.QuotaMode
 	accountID := credential.ID

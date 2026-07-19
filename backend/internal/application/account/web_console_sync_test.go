@@ -41,10 +41,12 @@ func TestSyncWebAccountsToConsoleIsIdempotentAndPreservesBuildLink(t *testing.T)
 
 	accounts := relational.NewAccountRepository(database)
 	token := "shared-sso-token"
+	cloudflareCookie := "cf_clearance=shared-clearance; __cf_bm=shared-bm"
 	webAccount, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
 		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
 		Name: "Grok Web primary", SourceKey: "sso:" + security.HashToken(token),
-		EncryptedAccessToken: encrypt(token), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+		EncryptedAccessToken: encrypt(token), EncryptedCloudflareCookie: encrypt(cloudflareCookie),
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +93,13 @@ func TestSyncWebAccountsToConsoleIsIdempotentAndPreservesBuildLink(t *testing.T)
 	if consoleAccount.Provider != accountdomain.ProviderConsole || consoleAccount.Name != "Grok Console primary" || decrypted != token {
 		t.Fatalf("console account = %#v, token = %q", consoleAccount, decrypted)
 	}
+	consoleCookie, err := cipher.Decrypt(consoleAccount.EncryptedCloudflareCookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consoleCookie != cloudflareCookie {
+		t.Fatalf("console Cloudflare cookie = %q, want %q", consoleCookie, cloudflareCookie)
+	}
 
 	second, err := service.SyncAllWebAccountsToConsoleWithProgress(ctx, nil, nil)
 	if err != nil {
@@ -135,6 +144,9 @@ func TestSyncWebAccountsToConsoleIsIdempotentAndPreservesBuildLink(t *testing.T)
 	}
 	if updatedWeb.LinkedAccountID != buildAccount.ID || updatedWeb.LinkedProvider != accountdomain.ProviderBuild {
 		t.Fatalf("updated web account = %#v", updatedWeb)
+	}
+	if len(updatedWeb.LinkedAccounts) != 2 || updatedWeb.LinkedAccounts[0].Provider != accountdomain.ProviderBuild || updatedWeb.LinkedAccounts[1].Provider != accountdomain.ProviderConsole || updatedWeb.LinkedAccounts[1].ID != consoleAccount.ID {
+		t.Fatalf("updated Web links = %#v", updatedWeb.LinkedAccounts)
 	}
 	_, total, err := accounts.List(ctx, repository.AccountListQuery{
 		Page: repository.PageQuery{Limit: 10}, Filter: repository.AccountListFilter{Provider: string(accountdomain.ProviderConsole)},

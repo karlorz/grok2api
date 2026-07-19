@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -66,6 +70,25 @@ func TestRecoverVideoJobsRecordsFailedAuditWithEgress(t *testing.T) {
 	}
 }
 
+func TestRecoverVideoJobsRecordsDetachedAccountSnapshot(t *testing.T) {
+	completedAt := time.Now().UTC()
+	repository := &videoUsageRepository{job: media.Job{
+		ID: "video_detached_account", RequestID: "request-detached-account",
+		ClientKeyID: 1, ClientKeyName: "client", AccountName: "deleted account",
+		Provider: "grok_web", Model: "grok-imagine-video", ModelRouteID: 3, UpstreamModel: "video",
+		Seconds: 8, Quality: "720p", Status: media.StatusFailed, ErrorCode: "generation_failed",
+		InputJSON: `{}`, CreatedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt,
+	}}
+	recorder := &durableVideoAuditRecorder{}
+	service := &Service{mediaJobs: repository, audits: recorder}
+	if err := service.RecoverVideoJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.last.AccountID != nil || recorder.last.AccountName != "deleted account" {
+		t.Fatalf("detached account audit = %#v", recorder.last)
+	}
+}
+
 func TestVideoQueueIsBoundedAndDeduplicated(t *testing.T) {
 	service := &Service{}
 	service.ConfigureMedia(&videoUsageRepository{}, 1)
@@ -81,6 +104,67 @@ func TestVideoQueueIsBoundedAndDeduplicated(t *testing.T) {
 	if service.enqueueVideoJob("video_overflow") {
 		t.Fatal("queue accepted a job beyond its capacity")
 	}
+}
+
+func TestPersistRemoteVideoRetriesSameResultWithoutRegeneration(t *testing.T) {
+	adapter := &videoPersistAdapter{failures: 1}
+	store := &videoAssetStoreStub{}
+	service := &Service{mediaAssets: store}
+	credential := account.Credential{ID: 42, Provider: account.ProviderWeb}
+	result, err := service.persistRemoteVideo(context.Background(), "video_job", adapter, credential, provider.VideoResult{URL: "https://assets.grok.com/video.mp4", ContentType: "video/mp4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.generateCalls != 0 || adapter.downloadCalls != 2 || adapter.lastCredentialID != credential.ID {
+		t.Fatalf("generate=%d download=%d credential=%d", adapter.generateCalls, adapter.downloadCalls, adapter.lastCredentialID)
+	}
+	if store.saveCalls != 1 || result.AssetID != "vid_local" || result.ContentType != "video/mp4" {
+		t.Fatalf("store calls=%d result=%#v", store.saveCalls, result)
+	}
+}
+
+type videoPersistAdapter struct {
+	failures         int
+	generateCalls    int
+	downloadCalls    int
+	lastCredentialID uint64
+}
+
+func (a *videoPersistAdapter) Provider() account.Provider { return account.ProviderWeb }
+
+func (a *videoPersistAdapter) GenerateVideo(context.Context, provider.VideoRequest) (provider.VideoResult, error) {
+	a.generateCalls++
+	return provider.VideoResult{}, errors.New("must not regenerate")
+}
+
+func (a *videoPersistAdapter) DownloadVideo(_ context.Context, credential account.Credential, _ string) (io.ReadCloser, string, int64, error) {
+	a.downloadCalls++
+	a.lastCredentialID = credential.ID
+	if a.downloadCalls <= a.failures {
+		return nil, "", 0, errors.New("temporary download failure")
+	}
+	return io.NopCloser(strings.NewReader("video")), "video/mp4", 5, nil
+}
+
+type videoAssetStoreStub struct{ saveCalls int }
+
+func (s *videoAssetStoreStub) SaveVideo(_ context.Context, jobID, contentType string, body io.Reader) (media.Asset, error) {
+	s.saveCalls++
+	if jobID != "video_job" {
+		return media.Asset{}, fmt.Errorf("job ID = %s", jobID)
+	}
+	if contentType != "video/mp4" {
+		return media.Asset{}, fmt.Errorf("content type = %s", contentType)
+	}
+	data, err := io.ReadAll(body)
+	if err != nil || string(data) != "video" {
+		return media.Asset{}, fmt.Errorf("video body = %q: %w", data, err)
+	}
+	return media.Asset{ID: "vid_local", Kind: "video", MIMEType: "video/mp4", SizeBytes: int64(len(data))}, nil
+}
+
+func (*videoAssetStoreStub) OpenVideo(context.Context, string) (media.Asset, io.ReadCloser, error) {
+	return media.Asset{}, nil, errors.New("not implemented")
 }
 
 type durableVideoAuditRecorder struct {
@@ -108,7 +192,13 @@ func (r *videoUsageRepository) GetMediaJob(context.Context, string, uint64) (med
 	return r.job, nil
 }
 
+func (r *videoUsageRepository) GetMediaJobsByIDs(context.Context, []string) ([]media.Job, error) {
+	return []media.Job{r.job}, nil
+}
+
 func (r *videoUsageRepository) UpdateMediaJob(context.Context, media.Job) error { return nil }
+
+func (r *videoUsageRepository) DeleteMediaJob(context.Context, string) error { return nil }
 
 func (r *videoUsageRepository) ListMediaJobs(context.Context, repository.MediaJobListQuery) ([]media.Job, int64, error) {
 	return nil, 0, nil
