@@ -30,7 +30,7 @@ func TestStickyLeaseRetriesSafeProxyConnectFailure(t *testing.T) {
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
 	}}
-	lease := &Lease{client: client, sticky: true}
+	lease := &Lease{client: client, sticky: true, proxyPool: true}
 	request, err := http.NewRequest(http.MethodPost, "https://example.com/generate", bytes.NewReader([]byte("payload")))
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +55,7 @@ func TestStickyLeaseRetriesExplicitResinConnectResponse(t *testing.T) {
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
 	}}
-	lease := &Lease{client: client, sticky: true}
+	lease := &Lease{client: client, sticky: true, proxyPool: true}
 	request, err := http.NewRequest(http.MethodGet, "https://example.com/models", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +77,7 @@ func TestStickyLeaseDoesNotRetryUnsafeUpstreamOutcomes(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &scriptedRequestClient{do: func(int, *http.Request) (*http.Response, error) { return test.response, nil }}
-			lease := &Lease{client: client, sticky: true}
+			lease := &Lease{client: client, sticky: true, proxyPool: true}
 			request, err := http.NewRequest(http.MethodPost, "https://example.com/generate", bytes.NewReader([]byte("payload")))
 			if err != nil {
 				t.Fatal(err)
@@ -90,6 +90,36 @@ func TestStickyLeaseDoesNotRetryUnsafeUpstreamOutcomes(t *testing.T) {
 	}
 }
 
+func TestLeaseDefersForbiddenClearanceInvalidationUntilClassification(t *testing.T) {
+	client := &scriptedRequestClient{do: func(int, *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: http.NoBody}, nil
+	}}
+	manager := &Manager{clearances: map[string]clearanceState{"account-bound": {}}}
+	lease := &Lease{client: client, clearanceManager: manager, clearanceKey: "account-bound"}
+	request, err := http.NewRequest(http.MethodPost, "https://example.com/generate", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := lease.DoDeferredForbidden(request)
+	if err != nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+	manager.clearanceMu.Lock()
+	invalidBeforeClassification := manager.clearances["account-bound"].invalid
+	manager.clearanceMu.Unlock()
+	if invalidBeforeClassification || client.closedIdle != 0 {
+		t.Fatalf("clearance invalid=%v closedIdle=%d before classification", invalidBeforeClassification, client.closedIdle)
+	}
+
+	lease.InvalidateClearance()
+	manager.clearanceMu.Lock()
+	invalidAfterClassification := manager.clearances["account-bound"].invalid
+	manager.clearanceMu.Unlock()
+	if !invalidAfterClassification || client.closedIdle != 1 {
+		t.Fatalf("clearance invalid=%v closedIdle=%d after classification", invalidAfterClassification, client.closedIdle)
+	}
+}
+
 func TestStickyLeaseDoesNotRetryAfterRequestWasWritten(t *testing.T) {
 	client := &scriptedRequestClient{do: func(_ int, request *http.Request) (*http.Response, error) {
 		trace := httptrace.ContextClientTrace(request.Context())
@@ -98,7 +128,7 @@ func TestStickyLeaseDoesNotRetryAfterRequestWasWritten(t *testing.T) {
 		}
 		return nil, errors.New("proxyconnect tcp: connection refused")
 	}}
-	lease := &Lease{client: client, sticky: true}
+	lease := &Lease{client: client, sticky: true, proxyPool: true}
 	request, err := http.NewRequest(http.MethodPost, "https://example.com/generate", bytes.NewReader([]byte("payload")))
 	if err != nil {
 		t.Fatal(err)
@@ -106,8 +136,8 @@ func TestStickyLeaseDoesNotRetryAfterRequestWasWritten(t *testing.T) {
 	if _, err := lease.Do(request); err == nil {
 		t.Fatal("written request error was unexpectedly swallowed")
 	}
-	if client.calls != 1 {
-		t.Fatalf("calls = %d, want 1", client.calls)
+	if client.calls != 1 || client.closedIdle != 1 {
+		t.Fatalf("calls=%d closedIdle=%d", client.calls, client.closedIdle)
 	}
 }
 
@@ -119,7 +149,7 @@ func TestStickyLeaseKeepsNonReplayableResinResponseReadable(t *testing.T) {
 		Body:       body,
 	}
 	client := &scriptedRequestClient{do: func(int, *http.Request) (*http.Response, error) { return resinResponse, nil }}
-	lease := &Lease{client: client, sticky: true}
+	lease := &Lease{client: client, sticky: true, proxyPool: true}
 	request, err := http.NewRequest(http.MethodPost, "https://example.com/generate", io.NopCloser(strings.NewReader("payload")))
 	if err != nil {
 		t.Fatal(err)
@@ -127,6 +157,9 @@ func TestStickyLeaseKeepsNonReplayableResinResponseReadable(t *testing.T) {
 	response, err := lease.Do(request)
 	if err != nil || response != resinResponse || client.calls != 1 {
 		t.Fatalf("response=%#v calls=%d err=%v", response, client.calls, err)
+	}
+	if client.closedIdle != 1 {
+		t.Fatalf("closedIdle=%d, want 1", client.closedIdle)
 	}
 	data, err := io.ReadAll(response.Body)
 	if err != nil || string(data) != "connect failed" {

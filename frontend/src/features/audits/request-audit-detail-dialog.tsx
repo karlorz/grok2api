@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Braces, FileText, KeyRound, Network, Server, TriangleAlert } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
@@ -12,13 +12,16 @@ import { ErrorState, LoadingState } from "@/shared/components/data-state";
 import { cn } from "@/shared/lib/cn";
 import { formatDateTime, formatNumber } from "@/shared/lib/format";
 
+const AUDIT_DETAIL_CACHE_TIME_MS = 60_000;
+
 export function RequestAuditDetailDialog({ audit, open, onOpenChange }: { audit: AuditDTO | null; open: boolean; onOpenChange: (open: boolean) => void }) {
   const { t, i18n } = useTranslation();
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null);
   const detailQuery = useQuery({
     queryKey: ["request-audits", "detail", audit?.id],
-    queryFn: () => getRequestAudit(audit?.id ?? ""),
+    queryFn: ({ signal }) => getRequestAudit(audit?.id ?? "", signal),
     enabled: open && audit !== null,
+    gcTime: AUDIT_DETAIL_CACHE_TIME_MS,
   });
 
   const attempts = detailQuery.data?.attempts ?? [];
@@ -80,7 +83,7 @@ function AttemptButton({ attempt, selected, onClick }: { attempt: AuditAttemptDT
     >
       <span className="flex items-center justify-between gap-2">
         <span className="flex min-w-0 items-center gap-2"><Icon className="size-3.5 shrink-0" />{t("audits.attemptNumber", { number: attempt.number })}</span>
-        {attempt.upstreamStatusCode ? <StatusBadge statusCode={attempt.upstreamStatusCode} /> : null}
+        {attempt.upstreamStatusCode ? <StatusBadge statusCode={attempt.upstreamStatusCode} failed={attempt.stage === "response_stream"} /> : null}
       </span>
     </button>
   );
@@ -88,8 +91,6 @@ function AttemptButton({ attempt, selected, onClick }: { attempt: AuditAttemptDT
 
 function AttemptDetail({ attempt }: { attempt: AuditAttemptDTO }) {
   const { t } = useTranslation();
-  const headersText = JSON.stringify(attempt.responseHeaders, null, 2);
-  const errorChainText = JSON.stringify(attempt.errorChain, null, 2);
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <Tabs defaultValue="overview" className="min-h-0 flex-1 overflow-hidden px-4 pb-4 sm:px-5">
@@ -108,24 +109,33 @@ function AttemptDetail({ attempt }: { attempt: AuditAttemptDTO }) {
           <AttemptOverview attempt={attempt} />
         </TabsContent>
         <TabsContent value="body" className="min-h-0 flex-1 overflow-hidden pt-3">
-          <CodePanel value={attempt.responseBody} displayValue={formattedResponseBody(attempt)} emptyMessage={t("audits.emptyResponseBody")} encoding={attempt.responseBodyEncoding} truncated={attempt.responseBodyTruncated} />
+          <AttemptResponseBody attempt={attempt} />
         </TabsContent>
         <TabsContent value="headers" className="min-h-0 flex-1 overflow-hidden pt-3">
-          <HeadersPanel headers={attempt.responseHeaders} copyValue={headersText} />
+          <HeadersPanel headers={attempt.responseHeaders} />
         </TabsContent>
         <TabsContent value="errors" className="min-h-0 flex-1 overflow-hidden pt-3">
-          <ErrorChainPanel attempt={attempt} copyValue={errorChainText} />
+          <ErrorChainPanel attempt={attempt} />
         </TabsContent>
       </Tabs>
     </main>
   );
 }
 
+function AttemptResponseBody({ attempt }: { attempt: AuditAttemptDTO }) {
+  const { t } = useTranslation();
+  const displayValue = useMemo(() => formattedResponseBody(attempt), [attempt]);
+  return <CodePanel value={attempt.responseBody} displayValue={displayValue} emptyMessage={t("audits.emptyResponseBody")} encoding={attempt.responseBodyEncoding} truncated={attempt.responseBodyTruncated} />;
+}
+
 function AttemptSummary({ attempt }: { attempt: AuditAttemptDTO }) {
   const { t } = useTranslation();
   const isHTTP = attempt.source === "upstream_http";
+  const isStreamFailure = isHTTP && attempt.stage === "response_stream";
   const Icon = isHTTP ? Server : attempt.source === "gateway_transport" ? Network : KeyRound;
-  const title = isHTTP
+  const title = isStreamFailure
+    ? t("audits.upstreamStreamFailure", { status: attempt.upstreamStatusCode ?? "-" })
+    : isHTTP
     ? t("audits.upstreamHttpFailure", { status: attempt.upstreamStatusCode ?? "-" })
     : attempt.source === "gateway_transport" ? t("audits.gatewayTransportFailure") : t("audits.credentialFailure");
   return (
@@ -185,9 +195,10 @@ function CodePanel({ value, displayValue, emptyMessage, encoding, truncated }: {
   );
 }
 
-function HeadersPanel({ headers, copyValue }: { headers: Record<string, string[]>; copyValue: string }) {
+function HeadersPanel({ headers }: { headers: Record<string, string[]> }) {
   const { t } = useTranslation();
-  const entries = Object.entries(headers);
+  const entries = useMemo(() => Object.entries(headers), [headers]);
+  const copyValue = useMemo(() => JSON.stringify(headers, null, 2), [headers]);
   if (entries.length === 0) return <EmptyPanel icon={<Braces />} message={t("audits.emptyResponseHeaders")} />;
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-md bg-muted/15">
@@ -207,8 +218,9 @@ function HeadersPanel({ headers, copyValue }: { headers: Record<string, string[]
   );
 }
 
-function ErrorChainPanel({ attempt, copyValue }: { attempt: AuditAttemptDTO; copyValue: string }) {
+function ErrorChainPanel({ attempt }: { attempt: AuditAttemptDTO }) {
   const { t } = useTranslation();
+  const copyValue = useMemo(() => JSON.stringify(attempt.errorChain, null, 2), [attempt.errorChain]);
   if (attempt.errorChain.length === 0) return <EmptyPanel icon={<Network />} message={t("audits.emptyErrorChain")} />;
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-md bg-muted/15">
@@ -235,7 +247,7 @@ function EmptyPanel({ icon, message }: { icon: ReactNode; message: string }) {
 function formattedResponseBody(attempt: AuditAttemptDTO): string {
   if (attempt.responseBodyEncoding !== "utf8") return attempt.responseBody;
   const contentType = Object.entries(attempt.responseHeaders).find(([name]) => name.toLowerCase() === "content-type")?.[1].join(";") ?? "";
-  if (!contentType.toLowerCase().includes("json")) return attempt.responseBody;
+  if (attempt.stage !== "response_stream" && !contentType.toLowerCase().includes("json")) return attempt.responseBody;
   try {
     return JSON.stringify(JSON.parse(attempt.responseBody), null, 2);
   } catch {
@@ -243,8 +255,10 @@ function formattedResponseBody(attempt: AuditAttemptDTO): string {
   }
 }
 
-function StatusBadge({ statusCode }: { statusCode: number }) {
-  const className = statusCode >= 500
+function StatusBadge({ statusCode, failed = false }: { statusCode: number; failed?: boolean }) {
+  const className = failed
+    ? "bg-amber-500/10 text-amber-700 dark:text-amber-300"
+    : statusCode >= 500
     ? "bg-red-500/10 text-red-700 dark:text-red-300"
     : statusCode >= 400 ? "bg-amber-500/10 text-amber-700 dark:text-amber-300"
       : statusCode >= 200 && statusCode < 300 ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "bg-muted text-muted-foreground";

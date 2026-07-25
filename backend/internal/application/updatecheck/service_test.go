@@ -83,6 +83,18 @@ func TestSemanticVersionComparison(t *testing.T) {
 	if compareSemanticVersion(upstream, fork10) <= 0 {
 		t.Fatal("expected upstream v3.0.2 > fork v3.0.2-10")
 	}
+	// Project hotfixes (upstream convention)
+	base, _ := parseSemanticVersion("v3.0.8")
+	hotfix1, _ := parseSemanticVersion("v3.0.8-hotfix.1")
+	hotfix2, _ := parseSemanticVersion("v3.0.8-hotfix.2")
+	sameBasePrerelease, _ := parseSemanticVersion("v3.0.8-rc.1")
+	next, _ := parseSemanticVersion("v3.0.9")
+	if compareSemanticVersion(hotfix1, base) <= 0 || compareSemanticVersion(hotfix2, hotfix1) <= 0 || compareSemanticVersion(next, hotfix2) <= 0 {
+		t.Fatal("project hotfix ordering is invalid")
+	}
+	if compareSemanticVersion(hotfix1, sameBasePrerelease) <= 0 {
+		t.Fatal("project hotfix should follow ordinary prereleases")
+	}
 }
 
 func TestNormalizeReleaseRepo(t *testing.T) {
@@ -114,5 +126,16 @@ func TestCheckUsesCustomReleaseRepo(t *testing.T) {
 	}
 	if snapshot.ReleaseURL != "https://github.com/acme/grok2api/releases/tag/v9.0.0" {
 		t.Fatalf("release url = %q", snapshot.ReleaseURL)
+	}
+}
+
+func TestCheckFindsHotfixAfterStableRelease(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v3.0.8-hotfix.1"}`)), Header: make(http.Header)}, nil
+	})}
+	service := NewService("v3.0.8", client)
+	snapshot := service.Check(context.Background())
+	if snapshot.Status != StatusUpdateAvailable || !snapshot.UpdateAvailable {
+		t.Fatalf("snapshot = %#v", snapshot)
 	}
 }

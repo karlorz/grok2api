@@ -69,7 +69,7 @@ func TestParseMediaPostResponsePreservesStatusAndPostID(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"error":"challenge"}`)),
 	})
 	var upstreamErr *webMediaUpstreamError
-	if !errors.As(err, &upstreamErr) || upstreamErr.status != http.StatusForbidden || !strings.Contains(upstreamErr.body, "challenge") {
+	if !errors.As(err, &upstreamErr) || upstreamErr.status != http.StatusForbidden || !strings.Contains(err.Error(), "challenge") {
 		t.Fatalf("error = %#v", err)
 	}
 }
@@ -754,6 +754,50 @@ func TestDecodeDirectFileUploadResponse(t *testing.T) {
 	}
 }
 
+func TestDecodeLegacyFileUploadResponseDiagnostics(t *testing.T) {
+	uploaded, err := decodeLegacyFileUploadResponse(http.StatusOK, []byte(`{"fileId":"file-1","fileUri":"users/test/file-1/content"}`))
+	if err != nil || uploaded.ID != "file-1" || uploaded.URI != "https://assets.grok.com/users/test/file-1/content" {
+		t.Fatalf("uploaded=%#v err=%v", uploaded, err)
+	}
+
+	_, err = decodeLegacyFileUploadResponse(http.StatusRequestEntityTooLarge, []byte(`{"error":{"code":8,"message":"payload too large"}}`))
+	var upstreamErr *webMediaUpstreamError
+	if !errors.As(err, &upstreamErr) || upstreamErr.status != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(err.Error(), ": 8: payload too large") {
+		t.Fatalf("upstream error = %v", err)
+	}
+
+	_, err = decodeLegacyFileUploadResponse(http.StatusOK, []byte("<html>bad gateway</html>"))
+	if err == nil || !strings.Contains(err.Error(), "上传文件响应无效") || strings.Contains(err.Error(), "<html>bad gateway</html>") {
+		t.Fatalf("invalid response error = %v", err)
+	}
+
+	_, err = decodeLegacyFileUploadResponse(http.StatusBadGateway, nil)
+	if !errors.As(err, &upstreamErr) || !strings.Contains(err.Error(), "<empty>") {
+		t.Fatalf("empty upstream error = %v", err)
+	}
+
+	secret := "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiMTIzNDU2In0.signaturevalue"
+	_, err = decodeLegacyFileUploadResponse(http.StatusBadGateway, []byte(`{"error":{"code":"upload_failed","message":"access_token=`+secret+` user@example.com https://assets.grok.com/file?id=secret"}}`))
+	if !errors.As(err, &upstreamErr) || !strings.Contains(err.Error(), "upload_failed") ||
+		!strings.Contains(err.Error(), "[REDACTED]") || !strings.Contains(err.Error(), "[REDACTED_EMAIL]") ||
+		!strings.Contains(err.Error(), "[REDACTED_URL]") || strings.Contains(err.Error(), secret) ||
+		strings.Contains(err.Error(), "user@example.com") || strings.Contains(err.Error(), "id=secret") {
+		t.Fatalf("unsafe upstream diagnostic = %v", err)
+	}
+}
+
+func TestWebMediaStreamErrorRedactsSensitiveValues(t *testing.T) {
+	err := webMediaStreamError(map[string]any{
+		"message": "Bearer sensitive-token from owner@example.com at https://grok.com/private?token=secret",
+	})
+	for _, secret := range []string{"sensitive-token", "owner@example.com", "token=secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("stream error exposed %q: %v", secret, err)
+		}
+	}
+}
+
 func TestDirectFileUploadFallbackOnlyForUnsupportedEndpoint(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone, http.StatusNotImplemented} {
 		if !directFileUploadFallbackStatus(status) {
@@ -820,6 +864,27 @@ func TestConsumeUpstreamChatFixture(t *testing.T) {
 	}
 	if parsed.ConversationID != "conv_1" || parsed.ParentID != "up_1" || parsed.Reasoning.String() != "thinking " || parsed.Text.String() != "hello" || len(parsed.SearchSources) != 1 {
 		t.Fatalf("parsed = %#v, text=%q reasoning=%q", parsed, parsed.Text.String(), parsed.Reasoning.String())
+	}
+}
+
+func TestWebVisibleStreamPhaseSuppressesLateReasoning(t *testing.T) {
+	phase := webVisibleStreamPhase{}
+	tests := []struct {
+		kind  string
+		delta string
+		want  bool
+	}{
+		{kind: "reasoning", delta: "first thought", want: true},
+		{kind: "text", delta: "", want: false},
+		{kind: "reasoning", delta: "continued thought", want: true},
+		{kind: "text", delta: "answer", want: true},
+		{kind: "reasoning", delta: "late thought", want: false},
+		{kind: "text", delta: " continued", want: true},
+	}
+	for index, test := range tests {
+		if got := phase.Allow(test.kind, test.delta); got != test.want {
+			t.Fatalf("step %d Allow(%q, %q) = %v, want %v", index, test.kind, test.delta, got, test.want)
+		}
 	}
 }
 

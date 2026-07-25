@@ -15,7 +15,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-type ModelRepository struct{ db *Database }
+type ModelRepository struct {
+	db       *Database
+	observer repository.InvalidationObserver
+}
 
 const availableRoutePredicate = `
 	EXISTS (
@@ -76,6 +79,16 @@ const (
 )
 
 func NewModelRepository(db *Database) *ModelRepository { return &ModelRepository{db: db} }
+
+func (r *ModelRepository) SetInvalidationObserver(observer repository.InvalidationObserver) {
+	r.observer = observer
+}
+
+func (r *ModelRepository) notifyInvalidation(ctx context.Context, event repository.InvalidationEvent) {
+	if r.observer != nil {
+		r.observer(ctx, event)
+	}
+}
 
 func (r *ModelRepository) List(ctx context.Context, input repository.ModelListQuery) ([]model.Route, int64, error) {
 	var total int64
@@ -179,42 +192,66 @@ func (r *ModelRepository) GetByPublicIDIncludingDisabled(ctx context.Context, pu
 
 func findModelRoutesByPublicID(db *gorm.DB, publicID string) ([]modelRouteModel, error) {
 	candidates := model.PublicIDCandidates(publicID)
-	rows := make([]modelRouteModel, 0, len(candidates))
+	alias := strings.TrimSpace(publicID)
+	query := db.Session(&gorm.Session{})
 	if len(candidates) > 0 {
-		if err := db.Session(&gorm.Session{}).Where("model_routes.public_id IN ?", candidates).
-			Order(modelProviderPriorityExpression + ", model_routes.id ASC").Find(&rows).Error; err != nil {
-			return nil, err
-		}
+		query = query.Where(`
+			(model_routes.public_id IN ? OR EXISTS (
+				SELECT 1 FROM model_route_aliases alias
+				WHERE alias.model_route_id = model_routes.id AND alias.alias = ?
+			))
+		`, candidates, alias).Clauses(clause.OrderBy{Expression: clause.Expr{
+			SQL:  "CASE WHEN model_routes.public_id IN ? THEN 0 ELSE 1 END, " + modelProviderPriorityExpression + ", model_routes.id ASC",
+			Vars: []any{candidates},
+		}})
+	} else {
+		query = query.Where(`
+			EXISTS (
+				SELECT 1 FROM model_route_aliases alias
+				WHERE alias.model_route_id = model_routes.id AND alias.alias = ?
+			)
+		`, alias).Order(modelProviderPriorityExpression + ", model_routes.id ASC")
 	}
-	var aliases []modelRouteModel
-	if err := db.Session(&gorm.Session{}).Joins("JOIN model_route_aliases alias ON alias.model_route_id = model_routes.id").
-		Where("alias.alias = ?", strings.TrimSpace(publicID)).
-		Order(modelProviderPriorityExpression + ", model_routes.id ASC").Find(&aliases).Error; err != nil {
+	var rows []modelRouteModel
+	if err := query.Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	seen := make(map[uint64]bool)
-	result := make([]modelRouteModel, 0, len(rows))
-	for _, values := range [][]modelRouteModel{rows, aliases} {
-		for _, row := range values {
-			if seen[row.ID] {
-				continue
-			}
-			seen[row.ID] = true
-			result = append(result, row)
-		}
-	}
-	if len(result) == 0 {
+	if len(rows) == 0 {
 		return nil, gorm.ErrRecordNotFound
 	}
-	return result, nil
+	return rows, nil
 }
 
 func (r *ModelRepository) GetByProviderUpstream(ctx context.Context, provider account.Provider, upstreamModel string) (model.Route, error) {
-	var row modelRouteModel
-	if err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error; err != nil {
+	var rows []modelRouteModel
+	if err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).Find(&rows).Error; err != nil {
 		return model.Route{}, mapError(err)
 	}
-	return toModelDomain(row), nil
+	if len(rows) == 0 {
+		return model.Route{}, repository.ErrNotFound
+	}
+	return toModelDomain(preferProviderUpstreamRoute(provider, upstreamModel, rows)), nil
+}
+
+// preferProviderUpstreamRoute 在同一上游存在多条对外名路由时选出稳定代表路由。
+func preferProviderUpstreamRoute(provider account.Provider, upstreamModel string, rows []modelRouteModel) modelRouteModel {
+	preferred := rows[0]
+	localID, _ := discoveredRouteDefaults(provider, upstreamModel)
+	canonical, hasCanonical := model.NormalizePublicID(provider, localID)
+	for _, row := range rows {
+		if hasCanonical && row.PublicID == canonical {
+			return row
+		}
+		originPreferred := row.Origin == string(model.OriginDiscovered) || row.Origin == string(model.OriginCatalog)
+		currentPreferred := preferred.Origin == string(model.OriginDiscovered) || preferred.Origin == string(model.OriginCatalog)
+		switch {
+		case originPreferred && !currentPreferred:
+			preferred = row
+		case originPreferred == currentPreferred && row.ID < preferred.ID:
+			preferred = row
+		}
+	}
+	return preferred
 }
 
 func (r *ModelRepository) ReplaceAccountCapabilities(ctx context.Context, accountID uint64, upstreamModels []string, syncedAt time.Time) error {
@@ -231,7 +268,7 @@ func (r *ModelRepository) ReplaceAccountCapabilities(ctx context.Context, accoun
 		unique[value] = struct{}{}
 		rows = append(rows, accountModelCapabilityModel{AccountID: accountID, UpstreamModel: value})
 	}
-	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("account_id = ?", accountID).Delete(&accountModelCapabilityModel{}).Error; err != nil {
 			return err
 		}
@@ -243,6 +280,10 @@ func (r *ModelRepository) ReplaceAccountCapabilities(ctx context.Context, accoun
 		state := accountModelSyncStateModel{AccountID: accountID, LastAttemptAt: syncedAt, LastSuccessAt: &syncedAt}
 		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "account_id"}}, DoUpdates: clause.AssignmentColumns([]string{"last_attempt_at", "last_success_at", "last_error"})}).Create(&state).Error
 	})
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCapabilityChanged, AccountID: accountID})
+	}
+	return err
 }
 
 func (r *ModelRepository) MarkAccountCapabilitySyncFailed(ctx context.Context, accountID uint64, attemptedAt time.Time, message string) error {
@@ -284,31 +325,26 @@ func (r *ModelRepository) ListStaleAccountSyncIDs(ctx context.Context, before ti
 }
 
 func (r *ModelRepository) UpsertDiscovered(ctx context.Context, provider account.Provider, upstreamModels []string) error {
-	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	changed := false
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing []modelRouteModel
 		if err := tx.Where("provider = ?", provider).Find(&existing).Error; err != nil {
 			return err
 		}
-		existingUpstream := make(map[string]bool, len(existing))
 		publicIDs := make(map[string]bool, len(existing))
 		for _, row := range existing {
-			if row.Provider == string(provider) {
-				existingUpstream[row.UpstreamModel] = true
-			}
 			publicIDs[row.PublicID] = true
 		}
 		rows := make([]modelRouteModel, 0, len(upstreamModels))
 		for _, upstreamModel := range upstreamModels {
-			if existingUpstream[upstreamModel] {
-				continue
-			}
 			localID, capability := discoveredRouteDefaults(provider, upstreamModel)
 			publicID, ok := model.NormalizePublicID(provider, localID)
 			if !ok {
 				return fmt.Errorf("Provider %s 发现了无效模型 ID %q", provider, localID)
 			}
+			// 仅按规范 public_id 幂等；允许手动别名路由与发现路由共享同一上游。
 			if publicIDs[publicID] {
-				return fmt.Errorf("Provider %s 的模型公开 ID %q 冲突", provider, publicID)
+				continue
 			}
 			if err := ensureModelPublicIDNotAlias(tx, publicID, 0); err != nil {
 				return err
@@ -317,11 +353,17 @@ func (r *ModelRepository) UpsertDiscovered(ctx context.Context, provider account
 			rows = append(rows, modelRouteModel{PublicID: publicID, Provider: string(provider), UpstreamModel: upstreamModel, Capability: string(capability), Origin: string(model.OriginDiscovered), Enabled: true})
 		}
 		if len(rows) > 0 {
-			// 多实例可能同时发现同一上游模型；唯一约束负责最终幂等，避免竞态变成整批失败。
-			return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(rows, 200).Error
+			// 多实例可能同时发现同一规范 public_id；public_id 唯一约束负责最终幂等。
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(rows, 200)
+			changed = result.Error == nil && result.RowsAffected > 0
+			return result.Error
 		}
 		return nil
 	})
+	if err == nil && changed {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationRouteChanged, Provider: provider})
+	}
+	return err
 }
 
 func discoveredRouteDefaults(provider account.Provider, upstreamModel string) (string, model.Capability) {
@@ -348,7 +390,12 @@ func discoveredRouteDefaults(provider account.Provider, upstreamModel string) (s
 }
 
 func (r *ModelRepository) UpsertRoutes(ctx context.Context, values []model.Route) error {
-	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	providers := make(map[account.Provider]struct{}, len(values))
+	for _, value := range values {
+		providers[value.Provider] = struct{}{}
+	}
+	changedProviders := make(map[account.Provider]struct{}, len(providers))
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, original := range values {
 			value := original
 			publicID, ok := model.NormalizePublicID(value.Provider, value.PublicID)
@@ -360,7 +407,7 @@ func (r *ModelRepository) UpsertRoutes(ctx context.Context, values []model.Route
 				return fmt.Errorf("模型路由目录包含无效条目")
 			}
 			var existing modelRouteModel
-			err := tx.Where("provider = ? AND upstream_model = ?", value.Provider, value.UpstreamModel).First(&existing).Error
+			err := tx.Where("public_id = ?", value.PublicID).First(&existing).Error
 			if err == nil {
 				continue
 			}
@@ -378,13 +425,20 @@ func (r *ModelRepository) UpsertRoutes(ctx context.Context, values []model.Route
 			if err := tx.Create(&row).Error; err != nil {
 				return mapError(err)
 			}
+			changedProviders[value.Provider] = struct{}{}
 		}
 		return nil
 	})
+	if err == nil {
+		for provider := range changedProviders {
+			r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationRouteChanged, Provider: provider})
+		}
+	}
+	return err
 }
 
 func (r *ModelRepository) ReplaceProviderRoutes(ctx context.Context, provider account.Provider, values []model.Route) error {
-	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		normalizedValues := make([]model.Route, len(values))
 		for index, value := range values {
 			publicID, ok := model.NormalizePublicID(provider, value.PublicID)
@@ -403,22 +457,39 @@ func (r *ModelRepository) ReplaceProviderRoutes(ctx context.Context, provider ac
 			return err
 		}
 
-		byUpstream := make(map[string]modelRouteModel, len(existing))
 		byPublicID := make(map[string]modelRouteModel, len(existing))
+		byUpstreamNonManual := make(map[string][]modelRouteModel, len(existing))
 		for _, row := range existing {
-			byUpstream[row.UpstreamModel] = row
 			byPublicID[row.PublicID] = row
+			if row.Origin == string(model.OriginManual) {
+				continue
+			}
+			byUpstreamNonManual[row.UpstreamModel] = append(byUpstreamNonManual[row.UpstreamModel], row)
 		}
 		matched := make(map[int]modelRouteModel, len(values))
 		usedIDs := make(map[uint64]bool, len(values))
 		for index, value := range values {
-			row, ok := byUpstream[value.UpstreamModel]
-			if !ok || usedIDs[row.ID] {
-				row, ok = byPublicID[value.PublicID]
-			}
-			if ok && !usedIDs[row.ID] {
+			if row, ok := byPublicID[value.PublicID]; ok && !usedIDs[row.ID] {
 				matched[index] = row
 				usedIDs[row.ID] = true
+				continue
+			}
+			// 仅回退匹配非手动路由，避免把手动别名路由改写成目录项。
+			candidates := byUpstreamNonManual[value.UpstreamModel]
+			var chosen modelRouteModel
+			found := false
+			for _, candidate := range candidates {
+				if usedIDs[candidate.ID] {
+					continue
+				}
+				if !found || candidate.ID < chosen.ID {
+					chosen = candidate
+					found = true
+				}
+			}
+			if found {
+				matched[index] = chosen
+				usedIDs[chosen.ID] = true
 			}
 		}
 		for _, row := range existing {
@@ -438,8 +509,8 @@ func (r *ModelRepository) ReplaceProviderRoutes(ctx context.Context, provider ac
 				return err
 			}
 		}
-		// Both identifiers are unique. Temporary values allow public IDs or upstream
-		// identifiers to be swapped while stable route IDs and key permissions survive.
+		// Temporary values allow public IDs or upstream identifiers to be swapped while
+		// stable route IDs and key permissions survive.
 		for index, row := range matched {
 			if row.PublicID != values[index].PublicID {
 				if err := preserveModelRouteAlias(tx, row.PublicID, row.ID); err != nil {
@@ -481,6 +552,10 @@ func (r *ModelRepository) ReplaceProviderRoutes(ctx context.Context, provider ac
 		}
 		return nil
 	})
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationRouteChanged, Provider: provider})
+	}
+	return err
 }
 
 func renameAccountModelCapability(tx *gorm.DB, provider account.Provider, oldModel, newModel string) error {
@@ -522,20 +597,28 @@ func (r *ModelRepository) Create(ctx context.Context, value model.Route, account
 	if err != nil {
 		return model.Route{}, err
 	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationRouteChanged, Provider: value.Provider, UpstreamModel: value.UpstreamModel})
+	if len(accountIDs) > 0 {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationModelBindingChanged, Provider: value.Provider, UpstreamModel: value.UpstreamModel})
+	}
 	return r.Get(ctx, row.ID)
 }
 
 func (r *ModelRepository) Update(ctx context.Context, value model.Route, accountIDs *[]uint64) (model.Route, error) {
-	publicID, ok := model.NormalizePublicID(value.Provider, value.PublicID)
-	if !ok {
-		return model.Route{}, fmt.Errorf("模型路由公开 ID 无效")
-	}
-	value.PublicID = publicID
+	var storedProvider account.Provider
+	var storedUpstreamModel string
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing modelRouteModel
 		if err := tx.Where("id = ?", value.ID).First(&existing).Error; err != nil {
 			return mapError(err)
 		}
+		storedProvider = account.Provider(existing.Provider)
+		storedUpstreamModel = existing.UpstreamModel
+		publicID, ok := model.NormalizePublicID(storedProvider, value.PublicID)
+		if !ok {
+			return fmt.Errorf("模型路由公开 ID 无效")
+		}
+		value.PublicID = publicID
 		if err := ensureModelPublicIDNotAlias(tx, value.PublicID, existing.ID); err != nil {
 			return err
 		}
@@ -568,10 +651,18 @@ func (r *ModelRepository) Update(ctx context.Context, value model.Route, account
 	if err != nil {
 		return model.Route{}, err
 	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationRouteChanged, Provider: storedProvider, UpstreamModel: storedUpstreamModel})
+	if accountIDs != nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationModelBindingChanged, Provider: storedProvider, UpstreamModel: storedUpstreamModel})
+	}
 	return r.Get(ctx, value.ID)
 }
 
 func (r *ModelRepository) Delete(ctx context.Context, id uint64) error {
+	var existing modelRouteModel
+	if err := r.db.db.WithContext(ctx).First(&existing, id).Error; err != nil {
+		return mapError(err)
+	}
 	result := r.db.db.WithContext(ctx).Delete(&modelRouteModel{}, id)
 	if result.Error != nil {
 		return mapError(result.Error)
@@ -579,6 +670,7 @@ func (r *ModelRepository) Delete(ctx context.Context, id uint64) error {
 	if result.RowsAffected == 0 {
 		return repository.ErrNotFound
 	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationRouteChanged, Provider: account.Provider(existing.Provider), UpstreamModel: existing.UpstreamModel})
 	return nil
 }
 
@@ -586,7 +678,20 @@ func (r *ModelRepository) DeleteMany(ctx context.Context, ids []uint64) (int64, 
 	if len(ids) == 0 {
 		return 0, nil
 	}
+	var existing []modelRouteModel
+	if err := r.db.db.WithContext(ctx).Where("id IN ?", ids).Find(&existing).Error; err != nil {
+		return 0, err
+	}
 	result := r.db.db.WithContext(ctx).Where("id IN ?", ids).Delete(&modelRouteModel{})
+	if result.Error == nil && result.RowsAffected > 0 {
+		providers := make(map[account.Provider]struct{}, len(existing))
+		for _, row := range existing {
+			providers[account.Provider(row.Provider)] = struct{}{}
+		}
+		for provider := range providers {
+			r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationRouteChanged, Provider: provider})
+		}
+	}
 	return result.RowsAffected, mapError(result.Error)
 }
 
@@ -608,8 +713,26 @@ func (r *ModelRepository) UpdateManyEnabled(ctx context.Context, ids []uint64, e
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Model(&modelRouteModel{}).Where("id IN ?", ids).Update("enabled", enabled)
-	return result.RowsAffected, result.Error
+	providers := make(map[account.Provider]struct{})
+	var updated int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var existing []modelRouteModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id IN ?", ids).Order("id ASC").Find(&existing).Error; err != nil {
+			return err
+		}
+		for _, row := range existing {
+			providers[account.Provider(row.Provider)] = struct{}{}
+		}
+		result := tx.Model(&modelRouteModel{}).Where("id IN ? AND enabled <> ?", ids, enabled).Update("enabled", enabled)
+		updated = result.RowsAffected
+		return result.Error
+	})
+	if err == nil && updated > 0 {
+		for provider := range providers {
+			r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationRouteChanged, Provider: provider})
+		}
+	}
+	return updated, err
 }
 
 func (r *ModelRepository) availableRoutes(query *gorm.DB) *gorm.DB {

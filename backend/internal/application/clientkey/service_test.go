@@ -48,13 +48,46 @@ func TestCreateUsesG2AClientKeyFormat(t *testing.T) {
 		t.Fatalf("negative rpm error = %v", err)
 	}
 	zero := 0
-	if _, err := service.Update(ctx, created.Key.ID, UpdateInput{MaxConcurrent: &zero}); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("zero concurrency error = %v", err)
+	updated, err := service.Update(ctx, created.Key.ID, UpdateInput{MaxConcurrent: &zero})
+	if err != nil || updated.MaxConcurrent != 0 {
+		t.Fatalf("zero concurrency update = %#v, err = %v", updated, err)
 	}
 	revealed, err := service.RevealSecret(ctx, created.Key.ID)
 	if err != nil || revealed != created.Secret {
 		t.Fatalf("revealed secret = %q, err = %v", revealed, err)
 	}
+}
+
+func TestUnlimitedRuntimeLimitsBypassLimiterStores(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "unlimited-runtime.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewClientKeyRepository(database)
+	service := NewService(repo, failingRateLimiter{}, failingConcurrencyLimiter{}, 60, 5, testCipher(t))
+	created, err := service.Create(ctx, CreateInput{
+		Name: "unlimited", Enabled: true,
+		RPMUnlimited: true, ConcurrencyUnlimited: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Key.RPMLimit != 0 || created.Key.MaxConcurrent != 0 {
+		t.Fatalf("persisted limits = rpm %d, concurrency %d", created.Key.RPMLimit, created.Key.MaxConcurrent)
+	}
+	value, release, err := service.Authenticate(ctx, created.Secret)
+	if err != nil {
+		t.Fatalf("authenticate unlimited key: %v", err)
+	}
+	if value.ID != created.Key.ID {
+		t.Fatalf("authenticated key = %d, want %d", value.ID, created.Key.ID)
+	}
+	release()
 }
 
 func TestAuthenticateDistinguishesRuntimeStoreFailures(t *testing.T) {
@@ -140,6 +173,36 @@ func TestBillingLimitUsesAtomicReservations(t *testing.T) {
 		t.Fatalf("authenticate unlimited key: %v", err)
 	}
 	unlimitedRelease()
+}
+
+func TestCleanupExpiredBillingProtectsActiveRequest(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "active-billing.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewClientKeyRepository(database)
+	service := NewService(repository, nil, nil, 60, 5, testCipher(t))
+	created, err := service.Create(ctx, CreateInput{Name: "active", Enabled: true, BillingLimitUSDTicks: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const eventID = "evt_active_cleanup_protection"
+	if reserved, reserveErr := service.ReserveBilling(ctx, created.Key, eventID, 40, time.Nanosecond); reserveErr != nil || !reserved {
+		t.Fatalf("reserve: reserved=%v err=%v", reserved, reserveErr)
+	}
+	time.Sleep(time.Millisecond)
+	if cleaned, cleanupErr := service.CleanupExpiredBilling(ctx, 10); cleanupErr != nil || cleaned != 0 {
+		t.Fatalf("active cleanup: cleaned=%d err=%v", cleaned, cleanupErr)
+	}
+	service.CompleteBilling(eventID)
+	if cleaned, cleanupErr := service.CleanupExpiredBilling(ctx, 10); cleanupErr != nil || cleaned != 1 {
+		t.Fatalf("completed cleanup: cleaned=%d err=%v", cleaned, cleanupErr)
+	}
 }
 
 func TestAuthenticateCachesUnlimitedKeyAndInvalidatesOnDisable(t *testing.T) {
