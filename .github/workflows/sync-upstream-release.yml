@@ -1,0 +1,75 @@
+name: Sync upstream release
+
+# Reuses scripts/sync-upstream-release.sh (same path as local operators):
+#   detect latest upstream release → merge → VERSION vX.Y.Z-0 → push → tag/release.
+# Does NOT deploy to kr01 (operator runs scripts/upgrade-kr01.sh / make update).
+on:
+  schedule:
+    # Daily 06:15 UTC — catch overnight upstream releases
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Plan only (no merge/push/release)"
+        required: false
+        type: boolean
+        default: false
+      skip_release:
+        description: "Sync + push only; do not cut GitHub Release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream → fork release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Need a token that can push to main + tags. Default GITHUB_TOKEN works
+          # for same-repo push when contents: write is granted.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure upstream remote
+        run: |
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/chenyme/grok2api.git"
+          else
+            git remote add upstream "https://github.com/chenyme/grok2api.git"
+          fi
+
+      - name: Sync upstream release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: chenyme/grok2api
+          FORK_REPO: ${{ github.repository }}
+          GIT_BRANCH: main
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--push)
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            args=(--dry-run)
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.skip_release }}" == "true" ]]; then
+            args=(--push)
+          else
+            args=(--push --release)
+          fi
+          chmod +x scripts/sync-upstream-release.sh scripts/fork-tag.sh
+          ./scripts/sync-upstream-release.sh "${args[@]}"

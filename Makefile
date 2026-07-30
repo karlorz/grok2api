@@ -1,4 +1,4 @@
-.PHONY: run swagger build-frontend build-backend-arm64 build-arm64 clean deploy update status version-next version-bump version-release
+.PHONY: run swagger build-frontend build-backend-arm64 build-arm64 clean deploy update status version-next version-bump version-release sync-upstream upgrade-kr01 test-scripts
 
 CONFIG ?= $(CURDIR)/config.yaml
 # App version for About UI / update checks. Fork scheme: v3.0.2-0 (upstream v3.0.2 + rev).
@@ -63,6 +63,23 @@ version-bump:
 
 version-release:
 	./scripts/fork-tag.sh --release
+
+# Merge latest upstream GitHub Release into main, set VERSION to vX.Y.Z-0.
+# CI: .github/workflows/sync-upstream-release.yml (schedule + workflow_dispatch).
+#   make sync-upstream              # merge + commit locally
+#   make sync-upstream PUSH=1       # also push origin/main
+#   make sync-upstream PUSH=1 RELEASE=1  # push + tag + GitHub Release
+sync-upstream:
+	./scripts/sync-upstream-release.sh $(if $(filter 1,$(PUSH)),--push) $(if $(filter 1,$(RELEASE)),--release) $(if $(filter 1,$(DRY_RUN)),--dry-run)
+
+# Upgrade binary deploy on HOST (default kr01). Curl one-liner:
+#   curl -fsSL https://raw.githubusercontent.com/karlorz/grok2api/main/scripts/upgrade-kr01.sh | bash
+upgrade-kr01:
+	./scripts/upgrade-kr01.sh
+
+# Unit/structural tests for fork version helpers + workflow/script wiring.
+test-scripts:
+	bash ./scripts/lib/fork_version_test.sh
 
 clean:
 	rm -rf dist/
