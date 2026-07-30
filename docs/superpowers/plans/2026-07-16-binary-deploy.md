@@ -1,5 +1,7 @@
 # Grok2API ARM64 Binary Deployment Implementation Plan
 
+> **Ops runbook (current):** see [docs/fork-operations.md](../../fork-operations.md) for fork version scheme, scheduled upstream sync, `make update`, and `curl …/upgrade-kr01.sh`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Create a compilation, packaging, and deployment pipeline to run grok2api natively as a systemd binary service behind Caddy on the ARM64 host `kr01`.
