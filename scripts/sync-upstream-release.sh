@@ -152,8 +152,8 @@ if ! git remote get-url "$ORIGIN_REMOTE" >/dev/null 2>&1; then
 fi
 
 echo "==== Fetching remotes ===="
-git fetch --prune --tags "$UPSTREAM_REMOTE"
-git fetch --prune --tags "$ORIGIN_REMOTE"
+git fetch --prune --tags --force "$UPSTREAM_REMOTE"
+git fetch --prune --tags --force "$ORIGIN_REMOTE"
 
 # Prefer exact release tag; fall back to remote main if tag missing.
 MERGE_REF=""
