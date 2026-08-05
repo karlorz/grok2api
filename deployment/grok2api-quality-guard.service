@@ -1,0 +1,21 @@
+[Unit]
+Description=Grok2API Egress Quality Guard (sidecar)
+After=grok2api.service
+Requires=grok2api.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/grok2api-quality-guard
+ExecStart=/usr/bin/python3 /opt/grok2api/quality_guard.py
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/grok2api-quality-guard
+
+[Install]
+WantedBy=multi-user.target

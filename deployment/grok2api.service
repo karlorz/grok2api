@@ -10,6 +10,8 @@ Group=root
 WorkingDirectory=/opt/grok2api
 # GitHub Releases for version checks (this fork). Override if needed.
 Environment=GROK2API_RELEASE_REPO=karlorz/grok2api
+# Quality guard bootstrap/state directory shared with the sidecar.
+Environment=GROK2API_QUALITY_GUARD_DIR=/var/lib/grok2api-quality-guard
 ExecStart=/opt/grok2api/grok2api --config /opt/grok2api/config.yaml --listen 127.0.0.1:8000
 Restart=on-failure
 RestartSec=5s
@@ -17,7 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/opt/grok2api
+ReadWritePaths=/opt/grok2api /var/lib/grok2api-quality-guard
 
 [Install]
 WantedBy=multi-user.target
