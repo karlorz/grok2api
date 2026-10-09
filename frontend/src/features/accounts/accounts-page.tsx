@@ -51,6 +51,7 @@ import {
   importAccounts,
   importConsoleAccounts,
   importWebAccounts,
+  DEFAULT_ACCOUNT_STATUS_FILTER,
   listAccounts,
   pollDeviceAuthorization,
   refreshAccountBilling,
@@ -131,7 +132,7 @@ export function AccountsPage() {
   const [pageSize, setPageSize] = useState(20);
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState(DEFAULT_ACCOUNT_STATUS_FILTER);
   const [egressFilter, setEgressFilter] = useState("");
   const [egressFilterSelectedLabel, setEgressFilterSelectedLabel] = useState("");
   const [egressFilterOptionsOpen, setEgressFilterOptionsOpen] = useState(false);
@@ -1007,7 +1008,7 @@ export function AccountsPage() {
     setPage(1);
     setSelection({ provider: value, ids: new Set() });
     setTypeFilter("");
-    setStatusFilter("");
+    setStatusFilter(DEFAULT_ACCOUNT_STATUS_FILTER);
     // A node or subscription narrowing belongs to the previous pool's scope;
     // keep the plain bound filter and drop the target.
     setEgressFilter((current) => (current.includes(":") ? "bound" : current));

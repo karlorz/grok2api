@@ -3,8 +3,10 @@ import { createObjectDecoder, createPaginatedDecoder, createValidatedDecoder, de
 import { i18n } from "@/shared/i18n";
 import type { SortOrder } from "@/shared/lib/table-sort";
 import { createAccountTaskProgressController, type AccountTaskProgressDTO, type AccountTaskProgressPhase } from "@/features/accounts/account-task-progress";
+import { accountListQuery } from "@/features/accounts/accounts-list-query";
 
 export type { AccountTaskProgressDTO } from "@/features/accounts/account-task-progress";
+export { accountListQuery, DEFAULT_ACCOUNT_STATUS_FILTER } from "@/features/accounts/accounts-list-query";
 
 export type AccountProvider = "grok_build" | "grok_web" | "grok_console";
 export type BuildRouteMode = "auto" | "build" | "xai";
@@ -233,21 +235,7 @@ type ListAccountsInput = {
 };
 
 export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<AccountDTO>> {
-  const query = new URLSearchParams({ page: String(input.page), pageSize: String(input.pageSize) });
-  if (input.search) query.set("search", input.search);
-  if (input.type) query.set("type", input.type);
-  if (input.status) query.set("status", input.status);
-  if (input.egress) query.set("egress", input.egress);
-  if (input.renewal) query.set("renewal", input.renewal);
-  if (input.risk) query.set("risk", input.risk);
-  if (input.agreement) query.set("agreement", input.agreement);
-  if (input.association) query.set("association", input.association);
-  if (input.sortBy && input.sortOrder) {
-    query.set("sortBy", input.sortBy);
-    query.set("sortOrder", input.sortOrder);
-  }
-  if (input.provider) query.set("provider", input.provider);
-  return apiRequest(`/api/admin/v1/accounts?${query}`, {}, decodeAccountPage);
+  return apiRequest(`/api/admin/v1/accounts?${accountListQuery(input)}`, {}, decodeAccountPage);
 }
 
 export function getAccountSummary(): Promise<AccountSummaryDTO> {
